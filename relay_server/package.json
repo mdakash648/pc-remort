@@ -1,0 +1,13 @@
+{
+  "name": "remotepad-relay",
+  "version": "1.0.0",
+  "description": "Lightweight low-latency WebSocket relay server for RemotePad PC <-> Android",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

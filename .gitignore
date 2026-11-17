@@ -1,0 +1,25 @@
+# Python
+pc_agent/.venv/
+pc_agent/build/
+pc_agent/dist/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Android / Gradle
+android_app/.gradle/
+android_app/build/
+android_app/app/build/
+android_app/local.properties
+android_app/.idea/
+android_app/keystore/
+android_app/keystore.properties
+*.jks
+*.keystore
+*.iml
+*.apk
+*.aab
+
+# OS
+.DS_Store
+Thumbs.db
