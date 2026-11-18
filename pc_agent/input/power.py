@@ -36,6 +36,9 @@ def _post_display_off_windows() -> None:
     try:
         # Brief delay prevents trailing touch/key events from immediately waking the monitor
         time.sleep(0.25)
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        ensure_thread_on_input_desktop(force=True)
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.PostMessageW.argtypes = (
             wintypes.HWND,
@@ -77,9 +80,9 @@ def _execute_power_windows(action: str) -> bool:
 
     try:
         if action == "lock":
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            user32.LockWorkStation.restype = wintypes.BOOL
-            return bool(user32.LockWorkStation())
+            from core.windows_integration import lock_active_console_session
+
+            return lock_active_console_session()
 
         if action == "display_off":
             threading.Thread(
@@ -116,8 +119,9 @@ def _execute_power_windows(action: str) -> bool:
             return True
 
         if action == "sign_out":
-            subprocess.Popen(["shutdown", "/l"], creationflags=_CREATE_NO_WINDOW)
-            return True
+            from core.windows_integration import logoff_active_console_session
+
+            return logoff_active_console_session()
     except Exception as exc:
         logger.warning("Failed to execute power action '%s': %s", action, exc)
         return False

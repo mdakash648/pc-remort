@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 import time
 from ctypes import wintypes
 from typing import Callable, Sequence
@@ -33,6 +34,8 @@ if _user32 is not None:
     _user32.SendInput.restype = wintypes.UINT
     _user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
     _user32.MapVirtualKeyW.restype = wintypes.UINT
+    _user32.VkKeyScanW.argtypes = (wintypes.WCHAR,)
+    _user32.VkKeyScanW.restype = ctypes.c_short
     _user32.OpenClipboard.argtypes = (wintypes.HWND,)
     _user32.OpenClipboard.restype = wintypes.BOOL
     _user32.EmptyClipboard.argtypes = ()
@@ -229,10 +232,60 @@ def _make_unicode_input(code_unit: int, key_up: bool = False) -> INPUT:
     )
 
 
+def _encode_ascii_vk_inputs(ch: str) -> list[INPUT] | None:
+    """Translate a printable ASCII character to hardware-like VK events via VkKeyScanW.
+
+    Used on the Windows Lock Screen (Winlogon desktop) where LogonUI.exe accepts
+    virtual-key scan events reliably to dismiss the lock curtain and enter PINs/passwords.
+    """
+    if _user32 is None or len(ch) != 1 or not (0x20 <= ord(ch) <= 0x7E):
+        return None
+    try:
+        packed = int(_user32.VkKeyScanW(ch))
+    except Exception:
+        return None
+    if packed == -1:
+        return None
+    vk = packed & 0xFF
+    shift_state = (packed >> 8) & 0xFF
+    if vk == 0:
+        return None
+
+    modifiers: list[int] = []
+    if shift_state & 1:
+        modifiers.append(VK_MAP["lshift"])
+    if shift_state & 2:
+        modifiers.append(VK_MAP["lctrl"])
+    if shift_state & 4:
+        modifiers.append(VK_MAP["lalt"])
+
+    events: list[INPUT] = [_make_vk_input(m, key_up=False) for m in modifiers]
+    events.append(_make_vk_input(vk, key_up=False))
+    events.append(_make_vk_input(vk, key_up=True))
+    events.extend(_make_vk_input(m, key_up=True) for m in reversed(modifiers))
+    return events
+
+
+def _is_on_winlogon_desktop() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        name = ensure_thread_on_input_desktop(force=False)
+        return bool(name and name.lower() == "winlogon")
+    except Exception:
+        return False
+
+
 def _send_inputs_windows(inputs: Sequence[INPUT]) -> int:
     global _last_kb_error_log
     if not inputs or _user32 is None:
         return 0
+    if sys.platform == "win32":
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        ensure_thread_on_input_desktop(force=False)
     array_type = INPUT * len(inputs)
     arr = array_type(*inputs)
     ctypes.set_last_error(0)
@@ -241,6 +294,16 @@ def _send_inputs_windows(inputs: Sequence[INPUT]) -> int:
         arr,
         ctypes.sizeof(INPUT),
     )
+    if sent != len(inputs) and sys.platform == "win32":
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        ensure_thread_on_input_desktop(force=True)
+        ctypes.set_last_error(0)
+        sent = _user32.SendInput(
+            len(inputs),
+            arr,
+            ctypes.sizeof(INPUT),
+        )
     if sent != len(inputs):
         err = ctypes.get_last_error()
         now = time.monotonic()
@@ -250,7 +313,7 @@ def _send_inputs_windows(inputs: Sequence[INPUT]) -> int:
                 logger.warning(
                     "Keyboard SendInput blocked (ERROR_ACCESS_DENIED). "
                     "Run pc_agent from your normal Windows desktop session "
-                    "(or as Administrator for elevated windows)."
+                    "(or via the RemotePad Boot Service for Lock Screen / elevated windows)."
                 )
             else:
                 logger.warning(
@@ -266,6 +329,10 @@ def _set_clipboard_text_windows(text: str) -> bool:
     """Copy Unicode text (with Windows CRLF paragraph breaks) to the Windows clipboard."""
     if _user32 is None or _kernel32 is None:
         return False
+    if sys.platform == "win32":
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        ensure_thread_on_input_desktop(force=True)
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     raw = (normalized + "\x00").encode("utf-16-le")
@@ -361,6 +428,7 @@ class KeyboardController:
         if not text:
             return 0
 
+        use_winlogon_vk = self._sender is _send_inputs_windows and _is_on_winlogon_desktop()
         events: list[INPUT] = []
         for ch in text:
             if ch == "\r":
@@ -373,6 +441,12 @@ class KeyboardController:
                 events.append(_make_vk_input(VK_MAP["tab"], key_up=False))
                 events.append(_make_vk_input(VK_MAP["tab"], key_up=True))
                 continue
+
+            if use_winlogon_vk:
+                vk_events = _encode_ascii_vk_inputs(ch)
+                if vk_events is not None:
+                    events.extend(vk_events)
+                    continue
 
             # Encode to UTF-16LE so both BMP (English, Bangla) and surrogate pairs work
             encoded = ch.encode("utf-16-le")

@@ -30,12 +30,22 @@ MAX_HEADER_BYTES = 32 * 1024
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+def _get_user_home() -> Path:
+    try:
+        from core.windows_integration import get_effective_user_home
+
+        return get_effective_user_home()
+    except Exception:
+        return Path.home()
+
+
 def get_default_received_dir() -> Path:
     """Return default folder for files received from phones (~/Downloads/RemotePad)."""
-    downloads = Path.home() / "Downloads"
+    home = _get_user_home()
+    downloads = home / "Downloads"
     if downloads.exists():
         return downloads / "RemotePad"
-    return Path.home() / "RemotePad_Received"
+    return home / "RemotePad_Received"
 
 
 def sanitize_filename(raw_name: str) -> str:
@@ -78,7 +88,7 @@ def _first_existing_dir(*paths: Path) -> Path | None:
 
 def list_quick_dirs(received_dir: Path) -> list[dict[str, str]]:
     """Return common PC folders for one-tap browsing from the phone."""
-    home = Path.home()
+    home = _get_user_home()
     onedrive = home / "OneDrive"
     candidates: list[tuple[str, Path | None]] = [
         ("Received", received_dir),
@@ -148,9 +158,15 @@ class FileTransferServer:
     ) -> None:
         self.host = host
         self._configured_port = port
-        self.received_dir = received_dir or get_default_received_dir()
+        self._explicit_received_dir = received_dir
         self.pc_name = pc_name or socket.gethostname()
         self._server: asyncio.AbstractServer | None = None
+
+    @property
+    def received_dir(self) -> Path:
+        if self._explicit_received_dir is not None:
+            return self._explicit_received_dir
+        return get_default_received_dir()
 
     @property
     def port(self) -> int:

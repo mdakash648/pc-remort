@@ -31,6 +31,13 @@ MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_HWHEEL = 0x1000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 
 WHEEL_DELTA = 120
 
@@ -124,6 +131,10 @@ def _send_inputs_windows(inputs: Sequence[INPUT]) -> int:
     global _last_send_error_log
     if not inputs or _user32 is None:
         return 0
+    if sys.platform == "win32":
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        ensure_thread_on_input_desktop(force=False)
     array_type = INPUT * len(inputs)
     arr = array_type(*inputs)
     ctypes.set_last_error(0)
@@ -132,6 +143,17 @@ def _send_inputs_windows(inputs: Sequence[INPUT]) -> int:
         arr,
         ctypes.sizeof(INPUT),
     )
+    if sent != len(inputs) and sys.platform == "win32":
+        # Desktop may have just transitioned (Default <-> Winlogon / UAC); refresh and retry once.
+        from core.windows_integration import ensure_thread_on_input_desktop
+
+        ensure_thread_on_input_desktop(force=True)
+        ctypes.set_last_error(0)
+        sent = _user32.SendInput(
+            len(inputs),
+            arr,
+            ctypes.sizeof(INPUT),
+        )
     if sent != len(inputs):
         err = ctypes.get_last_error()
         now = time.monotonic()
@@ -141,7 +163,7 @@ def _send_inputs_windows(inputs: Sequence[INPUT]) -> int:
                 logger.warning(
                     "SendInput blocked (ERROR_ACCESS_DENIED). "
                     "Make sure pc_agent is started from your normal Windows desktop session "
-                    "(or as Administrator when controlling elevated windows)."
+                    "(or via the RemotePad Boot Service for Lock Screen / elevated windows)."
                 )
             else:
                 logger.warning(
@@ -253,6 +275,50 @@ class MouseController:
             return (0, 0)
         sx, sy = self.scale_delta(dx, dy)
         return self.move_pixels(sx, sy)
+
+    def move_absolute(
+        self,
+        norm_x: float,
+        norm_y: float,
+        monitor_rect: tuple[int, int, int, int] | None = None,
+        virtual_rect: tuple[int, int, int, int] | None = None,
+    ) -> tuple[int, int]:
+        """Move cursor to normalized (0..1, 0..1) coordinates on the active or given monitor."""
+        nx = min(max(float(norm_x), 0.0), 1.0)
+        ny = min(max(float(norm_y), 0.0), 1.0)
+
+        if monitor_rect is not None:
+            left, top, right, bottom = monitor_rect
+            mon_w = max(right - left, 1)
+            mon_h = max(bottom - top, 1)
+            target_x = left + nx * max(mon_w - 1, 1)
+            target_y = top + ny * max(mon_h - 1, 1)
+
+            if virtual_rect is None and _user32 is not None:
+                v_left = int(_user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+                v_top = int(_user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+                v_w = max(int(_user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)), 1)
+                v_h = max(int(_user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)), 1)
+            elif virtual_rect is not None:
+                v_left, v_top, v_w, v_h = virtual_rect
+            else:
+                v_left, v_top, v_w, v_h = left, top, mon_w, mon_h
+
+            abs_x = int(round((target_x - v_left) * 65535.0 / max(v_w - 1, 1)))
+            abs_y = int(round((target_y - v_top) * 65535.0 / max(v_h - 1, 1)))
+            abs_x = min(max(abs_x, 0), 65535)
+            abs_y = min(max(abs_y, 0), 65535)
+            flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        else:
+            abs_x = int(round(nx * 65535.0))
+            abs_y = int(round(ny * 65535.0))
+            flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+
+        with self._lock:
+            self._rem_x = 0.0
+            self._rem_y = 0.0
+        self._sender([_make_mouse_input(flags, dx=abs_x, dy=abs_y)])
+        return (abs_x, abs_y)
 
     def button(self, button: str, state: str) -> bool:
         """Press or release left/middle/right mouse button."""

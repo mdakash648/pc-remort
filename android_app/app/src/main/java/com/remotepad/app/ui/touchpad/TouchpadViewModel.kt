@@ -10,11 +10,9 @@ import com.remotepad.app.data.model.ModifierKey
 import com.remotepad.app.data.model.ModifierState
 import com.remotepad.app.data.model.MouseButton
 import com.remotepad.app.input.AirMouseController
-import com.remotepad.app.input.MicStreamer
+import com.remotepad.app.network.ConnectionManager
 import com.remotepad.app.network.ConnectionState
 import com.remotepad.app.network.DiscoveredPc
-import com.remotepad.app.network.LanDiscovery
-import com.remotepad.app.network.LocalClient
 import com.remotepad.app.network.P2PUdpClient
 import com.remotepad.app.network.Protocol
 import kotlinx.coroutines.Dispatchers
@@ -24,7 +22,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -33,35 +30,19 @@ import kotlin.math.abs
 class TouchpadViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    private val client = LocalClient(application.applicationContext)
-    private val discovery = LanDiscovery(application.applicationContext)
+    private val connectionManager = ConnectionManager.getInstance(application.applicationContext)
 
-    val connectionState: StateFlow<ConnectionState> = client.state
-    val p2pClient: P2PUdpClient get() = client.p2pClient
-    val discoveredPcs: StateFlow<List<DiscoveredPc>> = discovery.discoveredPcs
-    val isScanning: StateFlow<Boolean> = discovery.isScanning
+    val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
+    val p2pClient: P2PUdpClient get() = connectionManager.p2pClient
+    val discoveredPcs: StateFlow<List<DiscoveredPc>> = connectionManager.discoveredPcs
+    val isScanning: StateFlow<Boolean> = connectionManager.isScanning
 
-    private val _host = MutableStateFlow(prefs.getString(KEY_HOST, "") ?: "")
-    val host: StateFlow<String> = _host.asStateFlow()
-
-    private val _port = MutableStateFlow(prefs.getString(KEY_PORT, DEFAULT_PORT) ?: DEFAULT_PORT)
-    val port: StateFlow<String> = _port.asStateFlow()
-
-    private val _relayUrl = MutableStateFlow(prefs.getString(KEY_RELAY_URL, DEFAULT_RELAY_URL) ?: DEFAULT_RELAY_URL)
-    val relayUrl: StateFlow<String> = _relayUrl.asStateFlow()
-
-    private val _relayDeviceId = MutableStateFlow(
-        prefs.getString(KEY_RELAY_DEVICE_ID, DEFAULT_RELAY_DEVICE_ID) ?: DEFAULT_RELAY_DEVICE_ID
-    )
-    val relayDeviceId: StateFlow<String> = _relayDeviceId.asStateFlow()
-
-    private val _relayToken = MutableStateFlow(
-        prefs.getString(KEY_RELAY_TOKEN, DEFAULT_RELAY_TOKEN) ?: DEFAULT_RELAY_TOKEN
-    )
-    val relayToken: StateFlow<String> = _relayToken.asStateFlow()
-
-    private val _autoConnect = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CONNECT, true))
-    val autoConnect: StateFlow<Boolean> = _autoConnect.asStateFlow()
+    val host: StateFlow<String> = connectionManager.host
+    val port: StateFlow<String> = connectionManager.port
+    val relayUrl: StateFlow<String> = connectionManager.relayUrl
+    val relayDeviceId: StateFlow<String> = connectionManager.relayDeviceId
+    val relayToken: StateFlow<String> = connectionManager.relayToken
+    val autoConnect: StateFlow<Boolean> = connectionManager.autoConnect
 
     private val _sensitivity = MutableStateFlow(prefs.getFloat(KEY_SENSITIVITY, 1.2f))
     val sensitivity: StateFlow<Float> = _sensitivity.asStateFlow()
@@ -84,14 +65,9 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
     private val _showVolumeModal = MutableStateFlow(false)
     val showVolumeModal: StateFlow<Boolean> = _showVolumeModal.asStateFlow()
 
-    private val _isMicEnabled = MutableStateFlow(false)
-    val isMicEnabled: StateFlow<Boolean> = _isMicEnabled.asStateFlow()
-
-    private val _micLevel = MutableStateFlow(0f)
-    val micLevel: StateFlow<Float> = _micLevel.asStateFlow()
-
-    private val _micError = MutableStateFlow<String?>(null)
-    val micError: StateFlow<String?> = _micError.asStateFlow()
+    val isMicEnabled: StateFlow<Boolean> = connectionManager.isMicEnabled
+    val micLevel: StateFlow<Float> = connectionManager.micLevel
+    val micError: StateFlow<String?> = connectionManager.micError
 
     private val _modifierStates = MutableStateFlow(
         ModifierKey.entries.associateWith { ModifierState.OFF }
@@ -105,14 +81,6 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
     }
     val isGyroAvailable: Boolean get() = airMouseController.isAvailable
 
-    private val micStreamer = MicStreamer(
-        onLevelChanged = { lvl -> _micLevel.value = lvl },
-        onError = { msg ->
-            _micError.value = msg
-            _isMicEnabled.value = false
-        },
-    )
-
     @Volatile
     private var appInForeground = true
 
@@ -122,12 +90,6 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
     private var volumeModalDismissJob: Job? = null
     private var lastLocalVolumeSendMs = 0L
     private var lastLocalVolumeEditMs = 0L
-
-    @Volatile
-    private var userManuallyDisconnected = false
-    private var lastAutoConnectAttemptMs = 0L
-    private var lastRelayAutoFallbackMs = 0L
-    private var internetFallbackJob: Job? = null
 
     // Event-driven coalescing delta buffers flushed on Dispatchers.IO with zero polling jitter
     private val deltaLock = Any()
@@ -139,78 +101,33 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
 
     init {
         startCoalescedSenderLoop()
-        observeDiscoveryAndAutoConnect()
+        observeConnectionForUiFeatures()
         observeRemoteVolume()
     }
 
-    fun onHostChanged(value: String) {
-        _host.value = value
+    fun onAppOpened(isFreshLaunch: Boolean) {
+        connectionManager.onAppOpened(isFreshLaunch = isFreshLaunch)
     }
 
-    fun onPortChanged(value: String) {
-        if (value.length <= 5 && value.all { it.isDigit() }) {
-            _port.value = value
-        }
-    }
+    fun onHostChanged(value: String) = connectionManager.onHostChanged(value)
 
-    fun onRelayUrlChanged(value: String) {
-        _relayUrl.value = value
-    }
+    fun onPortChanged(value: String) = connectionManager.onPortChanged(value)
 
-    fun onRelayDeviceIdChanged(value: String) {
-        _relayDeviceId.value = value
-    }
+    fun onRelayUrlChanged(value: String) = connectionManager.onRelayUrlChanged(value)
 
-    fun onRelayTokenChanged(value: String) {
-        _relayToken.value = value
-    }
+    fun onRelayDeviceIdChanged(value: String) = connectionManager.onRelayDeviceIdChanged(value)
 
-    fun connectViaRelay() {
-        cancelInternetFallback()
-        userManuallyDisconnected = false
-        val urlVal = _relayUrl.value.trim()
-        val idVal = _relayDeviceId.value.trim()
-        val tokenVal = _relayToken.value.trim()
-        prefs.edit()
-            .putString(KEY_RELAY_URL, urlVal)
-            .putString(KEY_RELAY_DEVICE_ID, idVal)
-            .putString(KEY_RELAY_TOKEN, tokenVal)
-            .apply()
-        client.connectRelay(urlVal, idVal, tokenVal)
-    }
+    fun onRelayTokenChanged(value: String) = connectionManager.onRelayTokenChanged(value)
 
-    fun onAutoConnectChanged(enabled: Boolean) {
-        _autoConnect.value = enabled
-        prefs.edit().putBoolean(KEY_AUTO_CONNECT, enabled).apply()
-        if (enabled) {
-            userManuallyDisconnected = false
-            lastAutoConnectAttemptMs = 0L
-            lastRelayAutoFallbackMs = 0L
-            val state = connectionState.value
-            if (state !is ConnectionState.Connected && state !is ConnectionState.Connecting) {
-                val target = selectPreferredPc(discoveredPcs.value)
-                if (target != null) {
-                    connectToDiscovered(target)
-                } else {
-                    discovery.probeNow()
-                    scheduleInternetAutoFallback()
-                }
-            }
-        } else {
-            cancelInternetFallback()
-        }
-    }
+    fun connectViaRelay() = connectionManager.connectManualRelay()
 
-    fun refreshDiscovery() {
-        discovery.probeNow()
-    }
+    fun onAutoConnectChanged(enabled: Boolean) = connectionManager.onAutoConnectChanged(enabled)
 
-    fun connectToDiscovered(pc: DiscoveredPc) {
-        _host.value = pc.host
-        _port.value = pc.port.toString()
-        prefs.edit().putString(KEY_LAST_PC_NAME, pc.name).apply()
-        connect()
-    }
+    fun refreshDiscovery() = connectionManager.refreshDiscovery()
+
+    fun connectToDiscovered(pc: DiscoveredPc) = connectionManager.connectToDiscovered(pc)
+
+    fun reconnectWifiFirst() = connectionManager.reconnectWifiFirst()
 
     fun onSensitivityChanged(value: Float) {
         val clamped = value.coerceIn(0.4f, 3.0f)
@@ -264,7 +181,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         }
         scheduleVolumeModalDismiss()
         if (connectionState.value is ConnectionState.Connected) {
-            client.send(Protocol.encodeMedia(if (up) "vol_up" else "vol_down"))
+            connectionManager.send(Protocol.encodeMedia(if (up) "vol_up" else "vol_down"))
         } else {
             // Update local visual indicator gracefully even when disconnected
             val step = if (up) 0.04f else -0.04f
@@ -313,7 +230,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         if (connectionState.value !is ConnectionState.Connected) return
         if (immediate || (now - lastLocalVolumeSendMs) >= VOLUME_SEND_THROTTLE_MS) {
             lastLocalVolumeSendMs = now
-            client.send(Protocol.encodeVolumeSet(clamped))
+            connectionManager.send(Protocol.encodeVolumeSet(clamped))
         }
     }
 
@@ -326,13 +243,13 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         }
         if (shouldSync != volumeSyncSentEnabled) {
             volumeSyncSentEnabled = shouldSync
-            client.send(Protocol.encodeVolumeSync(shouldSync))
+            connectionManager.send(Protocol.encodeVolumeSync(shouldSync))
         }
     }
 
     private fun observeRemoteVolume() {
         viewModelScope.launch {
-            client.volumeState.collect { remote ->
+            connectionManager.volumeState.collect { remote ->
                 if (!remote.synced) return@collect
                 // Ignore stale echoes while the user is actively dragging the volume arc
                 val now = SystemClock.elapsedRealtime()
@@ -355,29 +272,15 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setMicEnabled(enabled: Boolean) {
-        _micError.value = null
-        if (!enabled) {
-            _isMicEnabled.value = false
-            micStreamer.stop()
-            return
-        }
-        val connected = connectionState.value as? ConnectionState.Connected
-        if (connected == null) {
-            _micError.value = "Connect to PC first"
-            _isMicEnabled.value = false
-            return
-        }
-        if (connected.viaRelay || connected.host.isBlank()) {
-            _micError.value = "PC Mic works on Local Wi-Fi only"
-            _isMicEnabled.value = false
-            return
-        }
-        val started = micStreamer.start(connected.host, connected.micPort)
-        _isMicEnabled.value = started
+        connectionManager.setMicEnabled(enabled)
     }
 
     fun toggleMic() {
-        setMicEnabled(!_isMicEnabled.value)
+        connectionManager.toggleMic()
+    }
+
+    fun clearMicError() {
+        connectionManager.clearMicError()
     }
 
     fun toggleKeyboard() {
@@ -388,25 +291,12 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         _isKeyboardOpen.value = open
     }
 
-    fun connect() {
-        cancelInternetFallback()
-        userManuallyDisconnected = false
-        val hostVal = _host.value.trim()
-        val portVal = _port.value.toIntOrNull() ?: 8765
-        prefs.edit()
-            .putString(KEY_HOST, hostVal)
-            .putString(KEY_PORT, portVal.toString())
-            .apply()
-        client.connect(hostVal, portVal)
-    }
+    fun connect() = connectionManager.connectManualLan()
 
     fun disconnect() {
-        cancelInternetFallback()
-        userManuallyDisconnected = true
-        setMicEnabled(false)
         releaseAllModifiers()
         clearPendingDeltas()
-        client.disconnect()
+        connectionManager.disconnectByUser()
     }
 
     fun onMoveDelta(dxPx: Float, dyPx: Float, density: Float) {
@@ -440,30 +330,30 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
 
     fun onClick(button: MouseButton, count: Int = 1) {
         flushPendingMoveNow()
-        client.send(Protocol.encodeClick(button, count))
+        connectionManager.send(Protocol.encodeClick(button, count))
     }
 
     fun onButton(button: MouseButton, down: Boolean) {
         flushPendingMoveNow()
         val state = if (down) ButtonState.DOWN else ButtonState.UP
-        client.send(Protocol.encodeButton(button, state))
+        connectionManager.send(Protocol.encodeButton(button, state))
     }
 
     fun sendGesture(gesture: String) {
-        client.send(Protocol.encodeGesture(gesture))
+        connectionManager.send(Protocol.encodeGesture(gesture))
     }
 
     fun sendMediaAction(action: String) {
-        client.send(Protocol.encodeMedia(action))
+        connectionManager.send(Protocol.encodeMedia(action))
     }
 
     fun sendPowerAction(action: String) {
-        client.send(Protocol.encodePower(action))
+        connectionManager.send(Protocol.encodePower(action))
     }
 
     fun sendKeyCombo(keys: List<String>) {
         if (keys.isEmpty()) return
-        client.send(Protocol.encodeKeyCombo(keys))
+        connectionManager.send(Protocol.encodeKeyCombo(keys))
     }
 
     /**
@@ -475,11 +365,11 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         val next = when (current) {
             ModifierState.OFF -> ModifierState.ACTIVE
             ModifierState.ACTIVE -> {
-                client.send(Protocol.encodeKeyEvent(mod.wireValue, ButtonState.DOWN))
+                connectionManager.send(Protocol.encodeKeyEvent(mod.wireValue, ButtonState.DOWN))
                 ModifierState.LOCKED
             }
             ModifierState.LOCKED -> {
-                client.send(Protocol.encodeKeyEvent(mod.wireValue, ButtonState.UP))
+                connectionManager.send(Protocol.encodeKeyEvent(mod.wireValue, ButtonState.UP))
                 ModifierState.OFF
             }
         }
@@ -490,7 +380,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         val states = _modifierStates.value
         states.forEach { (mod, state) ->
             if (state == ModifierState.LOCKED) {
-                client.send(Protocol.encodeKeyEvent(mod.wireValue, ButtonState.UP))
+                connectionManager.send(Protocol.encodeKeyEvent(mod.wireValue, ButtonState.UP))
             }
         }
         _modifierStates.value = ModifierKey.entries.associateWith { ModifierState.OFF }
@@ -499,7 +389,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
     fun sendSpecialKey(keyWireValue: String) {
         val activeMods = consumeActiveModifiers()
         val keys = activeMods + keyWireValue
-        client.send(Protocol.encodeKeyCombo(keys))
+        connectionManager.send(Protocol.encodeKeyCombo(keys))
     }
 
     fun sendTypedText(text: String) {
@@ -513,7 +403,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
             val mappedKey = mapCharToShortcutKey(text[0])
             if (mappedKey != null) {
                 clearActiveModifiers()
-                client.send(Protocol.encodeKeyCombo(activeMods + mappedKey))
+                connectionManager.send(Protocol.encodeKeyCombo(activeMods + mappedKey))
                 return
             }
         }
@@ -521,13 +411,13 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         if (activeMods.isNotEmpty()) {
             clearActiveModifiers()
         }
-        client.send(Protocol.encodeText(text))
+        connectionManager.send(Protocol.encodeText(text))
     }
 
     fun sendParagraphText(text: String) {
         if (text.isEmpty()) return
         clearActiveModifiers()
-        client.send(Protocol.encodePaste(text))
+        connectionManager.send(Protocol.encodePaste(text))
     }
 
     private fun consumeActiveModifiers(): List<String> {
@@ -571,10 +461,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
                     }
                     if (!hasSendableDeltas()) break
 
-                    // Backpressure: if OkHttp still has unsent move frames queued on the socket,
-                    // wait briefly so new touch deltas coalesce into one fresh packet instead of
-                    // building up stale lag in the send buffer.
-                    if (client.queuedBytes() > MAX_QUEUED_BYTES) {
+                    if (connectionManager.queuedBytes() > MAX_QUEUED_BYTES) {
                         delay(BACKPRESSURE_DELAY_MS)
                         continue
                     }
@@ -614,7 +501,7 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
             }
         }
         if (mx == 0f && my == 0f) return false
-        return client.sendMove(mx, my)
+        return connectionManager.sendMove(mx, my)
     }
 
     private fun flushPendingDeltasNow(): Boolean {
@@ -639,10 +526,10 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
 
         var sent = false
         if (mx != 0f || my != 0f) {
-            sent = client.sendMove(mx, my) || sent
+            sent = connectionManager.sendMove(mx, my) || sent
         }
         if (sx != 0f || sy != 0f) {
-            sent = client.sendScroll(sx, sy) || sent
+            sent = connectionManager.sendScroll(sx, sy) || sent
         }
         return sent
     }
@@ -656,140 +543,48 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun observeDiscoveryAndAutoConnect() {
-        // Keep LAN discovery active whenever disconnected, and stop it once connected
-        // to save battery and keep Wi-Fi dedicated to low-latency touchpad frames.
+    private fun observeConnectionForUiFeatures() {
         viewModelScope.launch {
             connectionState.collect { state ->
                 when (state) {
                     is ConnectionState.Connected -> {
-                        cancelInternetFallback()
-                        discovery.stop()
                         updateAirMouseSensorState()
                         updateVolumeSyncState()
-                        if (state.pcName.isNotBlank() && state.pcName != _host.value.trim()) {
-                            prefs.edit().putString(KEY_LAST_PC_NAME, state.pcName).apply()
-                        }
                     }
                     is ConnectionState.Connecting -> {
-                        cancelInternetFallback()
-                        discovery.stop()
                         updateAirMouseSensorState()
                         updateVolumeSyncState()
                     }
                     ConnectionState.Disconnected, is ConnectionState.Error -> {
-                        setMicEnabled(false)
                         updateAirMouseSensorState()
                         updateVolumeSyncState()
-                        discovery.start()
-                        if (_autoConnect.value && !userManuallyDisconnected) {
-                            scheduleInternetAutoFallback()
-                        }
                     }
                 }
             }
         }
-
-        // Tier 1: Auto-connect to the preferred Local Wi-Fi PC immediately when discovered
-        // (highest priority, 2-5 ms latency).
-        viewModelScope.launch {
-            combine(
-                discoveredPcs,
-                connectionState,
-                autoConnect,
-            ) { pcs, state, isAutoEnabled ->
-                Triple(pcs, state, isAutoEnabled)
-            }.collect { (pcs, state, isAutoEnabled) ->
-                if (!isAutoEnabled || userManuallyDisconnected) return@collect
-                if (state is ConnectionState.Connected || state is ConnectionState.Connecting) {
-                    return@collect
-                }
-                val target = selectPreferredPc(pcs) ?: return@collect
-                cancelInternetFallback()
-
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastAutoConnectAttemptMs < AUTO_CONNECT_COOLDOWN_MS) {
-                    return@collect
-                }
-                lastAutoConnectAttemptMs = now
-                connectToDiscovered(target)
-            }
-        }
-    }
-
-    /**
-     * Tier 2 & 3 auto-fallback: if Local Wi-Fi finds no PC within LAN_DISCOVERY_GRACE_MS
-     * (e.g., user is outside on mobile data / external Wi-Fi), automatically connect via
-     * Internet (VPS), which immediately upgrades to Direct P2P UDP (~25-40 ms) and falls
-     * back to VPS Relay if strict NAT blocks UDP.
-     */
-    private fun scheduleInternetAutoFallback() {
-        if (!_autoConnect.value || userManuallyDisconnected) return
-        if (_relayUrl.value.isBlank() || _relayDeviceId.value.trim().length < 3 || _relayToken.value.trim().length < 8) {
-            return
-        }
-        if (internetFallbackJob?.isActive == true) return
-        internetFallbackJob = viewModelScope.launch {
-            delay(LAN_DISCOVERY_GRACE_MS)
-            if (!_autoConnect.value || userManuallyDisconnected) return@launch
-            val state = connectionState.value
-            if (state is ConnectionState.Connected || state is ConnectionState.Connecting) return@launch
-            if (discoveredPcs.value.isNotEmpty()) return@launch
-
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastRelayAutoFallbackMs < RELAY_AUTO_FALLBACK_COOLDOWN_MS) return@launch
-            lastRelayAutoFallbackMs = now
-            connectViaRelay()
-        }
-    }
-
-    private fun cancelInternetFallback() {
-        internetFallbackJob?.cancel()
-        internetFallbackJob = null
-    }
-
-    private fun selectPreferredPc(pcs: List<DiscoveredPc>): DiscoveredPc? {
-        if (pcs.isEmpty()) return null
-        val savedHost = _host.value.trim()
-        val savedName = prefs.getString(KEY_LAST_PC_NAME, null)
-        return pcs.firstOrNull { it.host == savedHost }
-            ?: pcs.firstOrNull { !savedName.isNullOrBlank() && it.name.equals(savedName, ignoreCase = true) }
-            ?: pcs.first()
     }
 
     override fun onCleared() {
         super.onCleared()
-        micStreamer.stop()
+        // Stop UI-bound sensors, but DO NOT stop the background microphone, disconnect
+        // ConnectionManager, or stop RemoteConnectionService so both PC connection and
+        // any manually enabled Phone Mic stay alive after closing the app.
         airMouseController.stop()
+        releaseAllModifiers()
         flushSignal.close()
-        discovery.shutdown()
-        client.shutdown()
+        connectionManager.onUiDetached()
     }
 
     companion object {
         private const val PREFS_NAME = "remotepad_prefs"
-        private const val KEY_HOST = "last_host"
-        private const val KEY_PORT = "last_port"
-        private const val KEY_RELAY_URL = "relay_url"
-        private const val KEY_RELAY_DEVICE_ID = "relay_device_id"
-        private const val KEY_RELAY_TOKEN = "relay_token"
-        private const val KEY_LAST_PC_NAME = "last_pc_name"
-        private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val KEY_SENSITIVITY = "sensitivity"
         private const val KEY_AIR_MOUSE_SPEED = "air_mouse_speed"
-        private const val DEFAULT_PORT = "8765"
-        private const val DEFAULT_RELAY_URL = "ws://182.255.88.108:8770"
-        private const val DEFAULT_RELAY_DEVICE_ID = "akash-pc"
-        private const val DEFAULT_RELAY_TOKEN = "rpad-7f4c9a2e8b1d6305"
         private const val AIR_MOUSE_MIN_SPEED = 0.2f
         private const val AIR_MOUSE_MAX_SPEED = 4.0f
         private const val AIR_MOUSE_SPEED_STEP = 0.2f
         private const val VOLUME_SEND_THROTTLE_MS = 35L
         private const val VOLUME_ECHO_GUARD_MS = 180L
         private const val VOLUME_MODAL_AUTO_DISMISS_MS = 3000L
-        private const val AUTO_CONNECT_COOLDOWN_MS = 3000L
-        private const val LAN_DISCOVERY_GRACE_MS = 2800L
-        private const val RELAY_AUTO_FALLBACK_COOLDOWN_MS = 12_000L
         private const val MIN_SEND_INTERVAL_MS = 8L
         private const val BACKPRESSURE_DELAY_MS = 4L
         private const val MAX_QUEUED_BYTES = 256L

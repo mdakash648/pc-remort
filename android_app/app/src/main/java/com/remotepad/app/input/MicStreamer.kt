@@ -28,18 +28,36 @@ class MicStreamer(
 ) {
     @Volatile
     private var running = false
+    @Volatile
+    private var activeHost: String? = null
+    @Volatile
+    private var activePort: Int = -1
+    @Volatile
+    private var activeRecorder: AudioRecord? = null
     private var workerThread: Thread? = null
     private val lock = Any()
+
+    val isStreaming: Boolean
+        get() = running
+
+    fun isStreamingTo(host: String, port: Int): Boolean {
+        val cleanHost = host.trim()
+        return running && activeHost == cleanHost && activePort == port
+    }
 
     @SuppressLint("MissingPermission")
     fun start(host: String, port: Int): Boolean {
         synchronized(lock) {
-            stopLocked()
             val cleanHost = host.trim()
             if (cleanHost.isEmpty() || port !in 1..65535) {
+                stopLocked()
                 onError("Invalid PC address for microphone")
                 return false
             }
+            if (running && activeHost == cleanHost && activePort == port && workerThread?.isAlive == true) {
+                return true
+            }
+            stopLocked()
 
             val minBuf = AudioRecord.getMinBufferSize(
                 SAMPLE_RATE,
@@ -60,9 +78,12 @@ class MicStreamer(
             }
 
             running = true
+            activeHost = cleanHost
+            activePort = port
+            activeRecorder = recorder
             workerThread = thread(name = "remotepad-mic-streamer", isDaemon = true) {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-                streamLoop(recorder, cleanHost, port)
+                streamLoop(recorder, bufferSize, cleanHost, port)
             }
             return true
         }
@@ -76,10 +97,16 @@ class MicStreamer(
 
     private fun stopLocked() {
         running = false
+        activeHost = null
+        activePort = -1
         val t = workerThread
         workerThread = null
         if (t != null && t.isAlive && t !== Thread.currentThread()) {
-            runCatching { t.join(400) }
+            runCatching { t.join(150) }
+            if (t.isAlive) {
+                runCatching { activeRecorder?.stop() }
+                runCatching { t.join(300) }
+            }
         }
         onLevelChanged(0f)
     }
@@ -109,23 +136,42 @@ class MicStreamer(
         return null
     }
 
-    private fun streamLoop(recorder: AudioRecord, host: String, port: Int) {
+    private fun attachAudioEffects(recorder: AudioRecord): Pair<NoiseSuppressor?, AcousticEchoCanceler?> {
+        val sessionId = recorder.audioSessionId
+        val ns = if (NoiseSuppressor.isAvailable()) {
+            runCatching { NoiseSuppressor.create(sessionId)?.apply { enabled = true } }.getOrNull()
+        } else {
+            null
+        }
+        val aec = if (AcousticEchoCanceler.isAvailable()) {
+            runCatching { AcousticEchoCanceler.create(sessionId)?.apply { enabled = true } }.getOrNull()
+        } else {
+            null
+        }
+        return ns to aec
+    }
+
+    private fun releaseRecorder(
+        recorder: AudioRecord?,
+        noiseSuppressor: NoiseSuppressor?,
+        echoCanceler: AcousticEchoCanceler?,
+    ) {
+        runCatching { recorder?.stop() }
+        runCatching { noiseSuppressor?.release() }
+        runCatching { echoCanceler?.release() }
+        runCatching { recorder?.release() }
+    }
+
+    private fun streamLoop(initialRecorder: AudioRecord, bufferSize: Int, host: String, port: Int) {
+        var recorder: AudioRecord? = initialRecorder
         var noiseSuppressor: NoiseSuppressor? = null
         var echoCanceler: AcousticEchoCanceler? = null
         var socket: DatagramSocket? = null
 
         try {
-            val sessionId = recorder.audioSessionId
-            if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = runCatching {
-                    NoiseSuppressor.create(sessionId)?.apply { enabled = true }
-                }.getOrNull()
-            }
-            if (AcousticEchoCanceler.isAvailable()) {
-                echoCanceler = runCatching {
-                    AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
-                }.getOrNull()
-            }
+            val (ns, aec) = attachAudioEffects(initialRecorder)
+            noiseSuppressor = ns
+            echoCanceler = aec
 
             val address = InetAddress.getByName(host)
             socket = DatagramSocket().apply {
@@ -135,13 +181,54 @@ class MicStreamer(
             val packetBuf = ByteArray(HEADER_BYTES + FRAME_BYTES)
             val pcmShortBuf = ShortArray(FRAME_SAMPLES)
 
-            recorder.startRecording()
+            initialRecorder.startRecording()
+            if (initialRecorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw IllegalStateException("Could not start microphone recording")
+            }
+
             var seq = 1
             var lastLevelMs = 0L
+            var consecutiveReadErrors = 0
+            var recoveryAttempts = 0
 
             while (running) {
-                val readSamples = recorder.read(pcmShortBuf, 0, FRAME_SAMPLES, AudioRecord.READ_BLOCKING)
-                if (readSamples <= 0) continue
+                val activeRec = recorder ?: break
+                val readSamples = activeRec.read(pcmShortBuf, 0, FRAME_SAMPLES, AudioRecord.READ_BLOCKING)
+                if (readSamples <= 0) {
+                    if (!running) break
+                    consecutiveReadErrors += 1
+                    runCatching { Thread.sleep(READ_ERROR_SLEEP_MS) }
+                    if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) {
+                        if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+                            throw IllegalStateException("Microphone stream interrupted")
+                        }
+                        recoveryAttempts += 1
+                        consecutiveReadErrors = 0
+                        releaseRecorder(recorder, noiseSuppressor, echoCanceler)
+                        recorder = null
+                        noiseSuppressor = null
+                        echoCanceler = null
+                        activeRecorder = null
+
+                        runCatching { Thread.sleep(RECOVERY_DELAY_MS) }
+                        if (!running) break
+
+                        val recreated = createAudioRecord(bufferSize)
+                            ?: throw IllegalStateException("Could not reopen phone microphone")
+                        recorder = recreated
+                        activeRecorder = recreated
+                        val (newNs, newAec) = attachAudioEffects(recreated)
+                        noiseSuppressor = newNs
+                        echoCanceler = newAec
+                        recreated.startRecording()
+                        if (recreated.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                            throw IllegalStateException("Could not resume microphone recording")
+                        }
+                    }
+                    continue
+                }
+                consecutiveReadErrors = 0
+                recoveryAttempts = 0
 
                 val totalBytes = packMicPacket(packetBuf, seq++, pcmShortBuf, readSamples)
                 val dgram = DatagramPacket(packetBuf, totalBytes, address, port)
@@ -166,11 +253,11 @@ class MicStreamer(
             }
         } finally {
             running = false
+            activeHost = null
+            activePort = -1
+            activeRecorder = null
             onLevelChanged(0f)
-            runCatching { recorder.stop() }
-            runCatching { noiseSuppressor?.release() }
-            runCatching { echoCanceler?.release() }
-            runCatching { recorder.release() }
+            releaseRecorder(recorder, noiseSuppressor, echoCanceler)
             runCatching { socket?.close() }
         }
     }
@@ -180,6 +267,10 @@ class MicStreamer(
         private const val FRAME_SAMPLES = 480 // 10 ms at 48 kHz
         private const val FRAME_BYTES = FRAME_SAMPLES * 2 // 960 bytes
         const val HEADER_BYTES = 8
+        private const val READ_ERROR_SLEEP_MS = 25L
+        private const val RECOVERY_DELAY_MS = 180L
+        private const val MAX_CONSECUTIVE_READ_ERRORS = 10
+        private const val MAX_RECOVERY_ATTEMPTS = 3
 
         /**
          * Pack 16-bit PCM samples into an RMIC UDP packet without overwriting the header:

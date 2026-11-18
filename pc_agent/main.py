@@ -7,21 +7,28 @@ import asyncio
 import ctypes
 import logging
 import sys
+import time
 from ctypes import wintypes
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from config import AgentConfig, get_config_dir
+from config import AgentConfig, get_config_dir, get_shared_config_dir, sync_config_to_shared
 from core.relay_client import RelayClient
 from core.runtime import AgentRuntime
 from core.server import LocalWebSocketServer, get_local_ipv4_addresses
+from core.service_ipc import RemoteAgentProxy
+from core.service_runner import run_agent_worker, run_service_supervisor
 from core.windows_integration import (
     SingleInstanceGuard,
     get_resource_path,
     is_admin,
+    is_boot_service_task_enabled,
+    is_system,
     relaunch_as_admin,
     set_app_user_model_id,
     set_autostart_enabled,
+    start_boot_service_task,
+    stop_boot_service_task,
 )
 from features.discovery import LanDiscoveryService
 from features.file_transfer import FileTransferServer
@@ -51,12 +58,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--install-autostart",
         action="store_true",
-        help="Register Windows auto-startup task (elevated when run as admin) and exit",
+        help="Register Windows pre-login boot service + tray logon task and exit",
     )
     parser.add_argument(
         "--remove-autostart",
         action="store_true",
-        help="Remove Windows auto-startup task/registry entry and exit",
+        help="Remove Windows boot service, logon task, and registry autostart entries and exit",
+    )
+    parser.add_argument(
+        "--service-supervisor",
+        action="store_true",
+        help="Run Session-0 SYSTEM boot supervisor (started automatically at Windows boot before login)",
+    )
+    parser.add_argument(
+        "--agent-worker",
+        action="store_true",
+        help="Run headless console-session SYSTEM agent worker (spawned by --service-supervisor)",
+    )
+    parser.add_argument(
+        "--start-service",
+        action="store_true",
+        help="Sync config and start the registered RemotePadService boot task immediately, then exit",
+    )
+    parser.add_argument(
+        "--stop-service",
+        action="store_true",
+        help="Stop the running RemotePadService supervisor and worker cleanly, then exit",
     )
     parser.add_argument("--host", type=str, default=None, help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None, help="Bind port (default: 8765)")
@@ -126,7 +153,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _configure_logging(debug: bool) -> None:
+def _configure_logging(
+    debug: bool,
+    *,
+    log_filename: str = "remotepad.log",
+    use_shared_dir: bool = False,
+) -> None:
     level = logging.DEBUG if debug else logging.INFO
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     handlers: list[logging.Handler] = []
@@ -137,10 +169,10 @@ def _configure_logging(debug: bool) -> None:
         handlers.append(stream_handler)
 
     try:
-        log_dir = get_config_dir()
+        log_dir = get_shared_config_dir() if (use_shared_dir or is_system()) else get_config_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
-            log_dir / "remotepad.log",
+            log_dir / log_filename,
             maxBytes=1_048_576,
             backupCount=2,
             encoding="utf-8",
@@ -315,6 +347,16 @@ def _show_fatal_error_dialog(title: str, message: str) -> None:
             print(f"{title}: {message}", file=sys.stderr)
 
 
+def _wait_for_service_proxy(timeout_s: float = 5.0) -> RemoteAgentProxy | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        proxy = RemoteAgentProxy.connect(timeout=0.6)
+        if proxy is not None:
+            return proxy
+        time.sleep(0.25)
+    return None
+
+
 def _run_tray_gui(config: AgentConfig, start_minimized: bool, no_elevate: bool = False) -> int:
     from ui.tray_app import RemotePadTrayApp
 
@@ -325,33 +367,52 @@ def _run_tray_gui(config: AgentConfig, start_minimized: bool, no_elevate: bool =
             guard.signal_existing_instance()
         return 0
 
-    # When launching the packaged .exe without Administrator rights (e.g. from Windows Search
-    # after quitting), elevate so mouse & keyboard work over Task Manager and other Admin apps.
-    if (
-        sys.platform == "win32"
-        and getattr(sys, "frozen", False)
-        and not no_elevate
-        and not is_admin()
-    ):
-        guard.close()
-        if relaunch_as_admin(extra_args=["--no-elevate"]):
-            return 0
-        # User declined UAC — continue gracefully in Standard mode
-        if not guard.acquire():
-            return 0
+    # 1. If the pre-login SYSTEM boot service is already running, attach directly with zero UAC
+    #    and zero port conflicts so the phone stays seamlessly connected across unlock/lock!
+    proxy: RemoteAgentProxy | None = RemoteAgentProxy.connect(timeout=0.8)
 
-    runtime = AgentRuntime(config)
-    try:
-        runtime.start(timeout=10.0)
-    except Exception as exc:
-        logging.getLogger(__name__).exception("Failed to start RemotePad PC Agent")
-        guard.close()
-        _show_fatal_error_dialog(
-            "RemotePad PC Agent — Startup Error",
-            f"Could not start RemotePad services:\n\n{exc}\n\n"
-            "Make sure another program is not using port 8765.",
+    if proxy is None and sys.platform == "win32" and getattr(sys, "frozen", False):
+        service_installed = is_boot_service_task_enabled()
+        if service_installed and start_minimized:
+            # Fast unlock right after boot: wait briefly for the booting SYSTEM worker to finish init
+            proxy = _wait_for_service_proxy(timeout_s=3.5)
+
+        if proxy is None:
+            # Elevate if needed so we can either start the SYSTEM boot service or run elevated in-process
+            if not no_elevate and not is_admin():
+                guard.close()
+                if relaunch_as_admin(extra_args=["--no-elevate"]):
+                    return 0
+                # User declined UAC — continue gracefully in Standard mode
+                if not guard.acquire():
+                    return 0
+
+            if is_admin() and service_installed:
+                sync_config_to_shared()
+                if start_boot_service_task():
+                    proxy = _wait_for_service_proxy(timeout_s=6.0)
+
+    runtime: AgentRuntime | RemoteAgentProxy
+    if proxy is not None:
+        logging.getLogger(__name__).info(
+            "Attached Tray GUI to running RemotePad service worker (system=%s)",
+            proxy.running_as_system,
         )
-        return 1
+        runtime = proxy
+    else:
+        local_runtime = AgentRuntime(config)
+        try:
+            local_runtime.start(timeout=10.0)
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Failed to start RemotePad PC Agent")
+            guard.close()
+            _show_fatal_error_dialog(
+                "RemotePad PC Agent — Startup Error",
+                f"Could not start RemotePad services:\n\n{exc}\n\n"
+                "Make sure another program is not using port 8765.",
+            )
+            return 1
+        runtime = local_runtime
 
     app = RemotePadTrayApp(runtime=runtime, start_minimized=start_minimized)
     guard.start_activation_listener(app.request_show_window)
@@ -359,7 +420,12 @@ def _run_tray_gui(config: AgentConfig, start_minimized: bool, no_elevate: bool =
         app.run()
     finally:
         guard.close()
-        runtime.stop(timeout=5.0)
+        if isinstance(runtime, RemoteAgentProxy):
+            if app.explicit_quit_requested:
+                runtime.shutdown_service(timeout=3.0)
+            runtime.stop(timeout=2.0)
+        else:
+            runtime.stop(timeout=5.0)
 
     if app.restart_as_admin_requested:
         relaunch_as_admin(extra_args=["--no-elevate"])
@@ -368,12 +434,23 @@ def _run_tray_gui(config: AgentConfig, start_minimized: bool, no_elevate: bool =
 
 def main() -> int:
     args = _build_arg_parser().parse_args()
-    _configure_logging(debug=args.debug)
+    if args.service_supervisor:
+        _configure_logging(debug=args.debug, log_filename="supervisor.log", use_shared_dir=True)
+        return run_service_supervisor()
+    if args.agent_worker:
+        _configure_logging(debug=args.debug, log_filename="remotepad.log", use_shared_dir=True)
+    else:
+        _configure_logging(debug=args.debug)
 
     if args.install_autostart:
         return 0 if set_autostart_enabled(True) else 1
     if args.remove_autostart:
         return 0 if set_autostart_enabled(False) else 1
+    if args.start_service:
+        sync_config_to_shared()
+        return 0 if start_boot_service_task() else 1
+    if args.stop_service:
+        return 0 if stop_boot_service_task() else 1
 
     config = AgentConfig.load()
     if args.host is not None:
@@ -404,6 +481,9 @@ def main() -> int:
         config.mouse_sensitivity = args.sensitivity
     if args.natural_scroll is not None:
         config.natural_scroll = args.natural_scroll
+
+    if args.agent_worker:
+        return run_agent_worker(config)
 
     if args.console:
         _apply_windows_console_icon()

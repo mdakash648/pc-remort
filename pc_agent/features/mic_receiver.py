@@ -34,6 +34,8 @@ BITS_PER_SAMPLE = 16
 
 _WAVE_FORMAT_PCM = 1
 _WHDR_DONE = 0x00000001
+_DRV_QUERYFUNCTIONINSTANCEID = 0x0800 + 17
+_DRV_QUERYFUNCTIONINSTANCEIDSIZE = 0x0800 + 18
 _MAX_IN_FLIGHT_BUFFERS = 8  # ~80 ms cap at 10 ms/packet to keep voice latency tight
 _IDLE_CLOSE_SECONDS = 2.0
 
@@ -43,6 +45,17 @@ _VIRTUAL_CABLE_KEYWORDS = (
     "voicemeeter",
     "virtual",
 )
+
+
+def is_virtual_mic_device_name(name: str, preferred_name: str = "") -> bool:
+    """Return True if a playback device name is a virtual audio cable (never a physical speaker)."""
+    lower = name.strip().lower()
+    if not lower:
+        return False
+    pref = preferred_name.strip().lower()
+    if pref and pref in lower:
+        return True
+    return any(keyword in lower for keyword in _VIRTUAL_CABLE_KEYWORDS)
 
 
 class _WAVEOUTCAPSW(ctypes.Structure):
@@ -111,10 +124,49 @@ def _load_winmm() -> ctypes.WinDLL | None:
     dll.waveOutReset.restype = wintypes.UINT
     dll.waveOutClose.argtypes = (ctypes.c_void_p,)
     dll.waveOutClose.restype = wintypes.UINT
+    dll.waveOutGetID.argtypes = (ctypes.c_void_p, ctypes.POINTER(wintypes.UINT))
+    dll.waveOutGetID.restype = wintypes.UINT
+    dll.waveOutMessage.argtypes = (ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p)
+    dll.waveOutMessage.restype = wintypes.UINT
     return dll
 
 
 _winmm = _load_winmm()
+
+
+def _query_waveout_endpoint_id(device_or_handle: ctypes.c_void_p) -> str:
+    """Query the Windows Audio Endpoint GUID string for a waveOut device index or open handle."""
+    if _winmm is None:
+        return ""
+    try:
+        size = wintypes.DWORD(0)
+        r1 = _winmm.waveOutMessage(
+            device_or_handle,
+            _DRV_QUERYFUNCTIONINSTANCEIDSIZE,
+            ctypes.byref(size),
+            None,
+        )
+        if r1 != 0 or size.value <= 0 or size.value > 4096:
+            return ""
+        buf = ctypes.create_unicode_buffer(size.value // 2 + 2)
+        r2 = _winmm.waveOutMessage(
+            device_or_handle,
+            _DRV_QUERYFUNCTIONINSTANCEID,
+            buf,
+            ctypes.c_void_p(size.value),
+        )
+        return buf.value if r2 == 0 else ""
+    except Exception:
+        return ""
+
+
+def _get_waveout_device_name(device_id: int) -> str:
+    if _winmm is None:
+        return ""
+    caps = _WAVEOUTCAPSW()
+    if _winmm.waveOutGetDevCapsW(device_id, ctypes.byref(caps), ctypes.sizeof(caps)) == 0:
+        return str(caps.szPname).strip()
+    return ""
 
 
 def list_playback_devices() -> list[tuple[int, str]]:
@@ -211,11 +263,6 @@ class WinMMWaveOutSink:
             return False
         if self._handle is not None:
             return True
-        if self._device_id is None:
-            found = find_virtual_mic_device(self._preferred_device)
-            if found is None:
-                return False
-            self._device_id, self._device_name = found
 
         block_align = CHANNELS * (BITS_PER_SAMPLE // 8)
         wfx = _WAVEFORMATEX(
@@ -227,21 +274,66 @@ class WinMMWaveOutSink:
             wBitsPerSample=BITS_PER_SAMPLE,
             cbSize=0,
         )
-        handle = ctypes.c_void_p()
-        res = _winmm.waveOutOpen(
-            ctypes.byref(handle),
-            self._device_id,
-            ctypes.byref(wfx),
-            0,
-            0,
-            0,
-        )
-        if res != 0 or not handle.value:
-            logger.warning("waveOutOpen failed for '%s' (err=%d)", self._device_name, res)
-            return False
-        self._handle = handle
-        logger.info("Opened virtual mic output: %s", self._device_name)
-        return True
+
+        # IMPORTANT: Windows winmm dynamically shifts waveOut indices whenever the user's
+        # default playback device changes (device 0 is ALWAYS the current default speaker!).
+        # Therefore we MUST re-enumerate find_virtual_mic_device() fresh every time we open
+        # and verify the opened handle is genuinely the virtual cable (never a physical speaker).
+        for attempt in range(3):
+            found = find_virtual_mic_device(self._preferred_device)
+            if found is None:
+                self._device_id = None
+                self._device_name = ""
+                return False
+            dev_id, dev_name = found
+            expected_ep = _query_waveout_endpoint_id(ctypes.c_void_p(dev_id))
+
+            handle = ctypes.c_void_p()
+            res = _winmm.waveOutOpen(
+                ctypes.byref(handle),
+                dev_id,
+                ctypes.byref(wfx),
+                0,
+                0,
+                0,
+            )
+            if res != 0 or not handle.value:
+                logger.warning("waveOutOpen failed for '%s' (id=%d, err=%d)", dev_name, dev_id, res)
+                return False
+
+            # Verify the actually opened device did not race onto a physical speaker
+            actual_id = wintypes.UINT(dev_id)
+            _winmm.waveOutGetID(handle, ctypes.byref(actual_id))
+            actual_name = _get_waveout_device_name(int(actual_id.value)) or dev_name
+            actual_ep = _query_waveout_endpoint_id(handle)
+
+            endpoint_mismatch = bool(expected_ep and actual_ep and actual_ep.lower() != expected_ep.lower())
+            if endpoint_mismatch or not is_virtual_mic_device_name(actual_name, self._preferred_device):
+                logger.warning(
+                    "Refusing non-virtual waveOut target '%s' (id=%d, ep=%s) on attempt %d; retrying...",
+                    actual_name,
+                    actual_id.value,
+                    actual_ep or "unknown",
+                    attempt + 1,
+                )
+                try:
+                    _winmm.waveOutClose(handle)
+                except Exception:
+                    pass
+                continue
+
+            self._device_id = int(actual_id.value)
+            self._device_name = actual_name
+            self._handle = handle
+            logger.info(
+                "Opened verified virtual mic output: %s (waveOut id=%d, endpoint=%s)",
+                self._device_name,
+                self._device_id,
+                actual_ep or expected_ep or "n/a",
+            )
+            return True
+
+        return False
 
     def _reclaim_done_locked(self) -> None:
         if _winmm is None or self._handle is None:
@@ -279,9 +371,11 @@ class WinMMWaveOutSink:
                 reserved=0,
             )
             if _winmm.waveOutPrepareHeader(self._handle, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                self._close_locked()
                 return
             if _winmm.waveOutWrite(self._handle, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
                 _winmm.waveOutUnprepareHeader(self._handle, ctypes.byref(hdr), ctypes.sizeof(hdr))
+                self._close_locked()
                 return
             self._in_flight.append((hdr, buf))
             self._last_write_time = time.monotonic()

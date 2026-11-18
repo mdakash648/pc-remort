@@ -53,6 +53,7 @@ class RelayClient:
         self._connected = False
         self._peer_online = False
         self._last_error: str | None = None
+        self._active_session: _ClientSession | None = None
         file_handler = P2PFileHandler(file_server) if file_server is not None else None
         self._p2p: P2PUdpEndpoint | None = (
             P2PUdpEndpoint(
@@ -60,6 +61,7 @@ class RelayClient:
                 on_move=self._on_p2p_move,
                 on_scroll=self._on_p2p_scroll,
                 file_handler=file_handler,
+                on_screen_ack=self._on_p2p_screen_ack,
             )
             if p2p_enabled
             else None
@@ -83,10 +85,26 @@ class RelayClient:
 
     def _on_p2p_move(self, dx: float, dy: float) -> None:
         self.server._smoother.enqueue(dx, dy)
+        session = self._active_session
+        if session is not None and session.screen_streamer is not None:
+            session.screen_streamer.notify_input_activity()
 
     def _on_p2p_scroll(self, dx: float, dy: float) -> None:
         self.server._smoother.flush()
         self.server.mouse.scroll(dx, dy)
+        session = self._active_session
+        if session is not None and session.screen_streamer is not None:
+            session.screen_streamer.notify_input_activity()
+
+    async def _send_p2p_screen(self, wire_frame: bytes) -> bool:
+        if self._p2p is None:
+            return False
+        return await self._p2p.send_screen_frame_paced(wire_frame)
+
+    def _on_p2p_screen_ack(self, seq: int) -> None:
+        session = self._active_session
+        if session is not None and session.screen_streamer is not None:
+            session.screen_streamer.on_ack(seq)
 
     async def start(self) -> None:
         if not self.relay_url or not self.device_id or len(self.token) < 8:
@@ -180,7 +198,12 @@ class RelayClient:
                 except Exception as exc:
                     logger.debug("Relay WS signaling send failed: %s", exc)
 
-            session = _ClientSession()
+            session = _ClientSession(
+                is_via_relay=True,
+                p2p_send_screen=self._send_p2p_screen,
+                is_p2p_active=lambda: self.is_p2p_active,
+            )
+            self._active_session = session
             peer = f"relay:{self.device_id}"
             try:
                 async for raw_message in ws:
@@ -237,6 +260,8 @@ class RelayClient:
             finally:
                 self._connected = False
                 self._peer_online = False
+                if self._active_session is session:
+                    self._active_session = None
                 await self._cleanup_session(session)
 
     async def _safe_handle_p2p_offer(
@@ -259,6 +284,7 @@ class RelayClient:
         self._cancel_p2p_offer_task()
         if self._p2p is not None:
             self._p2p.reset_peer()
+        await self.server._stop_screen_stream(session)
         await self.server._stop_volume_sync(session)
         self.server._smoother.reset()
         for btn in list(session.held_buttons):

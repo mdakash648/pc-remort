@@ -20,6 +20,7 @@ ButtonState = Literal["down", "up"]
 
 VALID_BUTTONS = frozenset({"left", "middle", "right"})
 VALID_BUTTON_STATES = frozenset({"down", "up"})
+VALID_SCREEN_QUALITIES = frozenset({"auto", "hd", "balanced", "fast"})
 
 MAX_MOVE_DELTA = 2000.0
 MAX_SCROLL_DELTA = 200.0
@@ -27,6 +28,10 @@ MAX_CLICK_COUNT = 3
 MAX_KEY_COMBO_LEN = 8
 MAX_TEXT_LEN = 4096
 MAX_PASTE_LEN = 65536
+MAX_SCREEN_FPS = 30
+MAX_SCREEN_WIDTH = 1920
+MIN_SCREEN_WIDTH = 320
+MAX_MONITOR_INDEX = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +112,43 @@ class VolumeSyncMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class MoveAbsMessage:
+    x: float
+    y: float
+    monitor: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenStartMessage:
+    quality: str = "auto"
+    fps: int = 20
+    max_width: int = 1280
+    monitor: int = 0
+    prefer_p2p: bool = True
+    hide_cursor: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenStopMessage:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenConfigMessage:
+    quality: str | None = None
+    fps: int | None = None
+    max_width: int | None = None
+    monitor: int | None = None
+    prefer_p2p: bool | None = None
+    hide_cursor: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenAckMessage:
+    seq: int
+
+
+@dataclass(frozen=True, slots=True)
 class PingMessage:
     pass
 
@@ -119,6 +161,7 @@ class UnknownMessage:
 ParsedMessage = Union[
     HelloMessage,
     MoveMessage,
+    MoveAbsMessage,
     ButtonMessage,
     ClickMessage,
     ScrollMessage,
@@ -131,6 +174,10 @@ ParsedMessage = Union[
     PowerMessage,
     VolumeSetMessage,
     VolumeSyncMessage,
+    ScreenStartMessage,
+    ScreenStopMessage,
+    ScreenConfigMessage,
+    ScreenAckMessage,
     PingMessage,
     UnknownMessage,
 ]
@@ -173,6 +220,30 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
         if dx is None or dy is None:
             return None
         return MoveMessage(dx=dx, dy=dy)
+
+    if msg_type == "move_abs":
+        raw_x = data.get("x")
+        raw_y = data.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_x, (int, float))
+            or not isinstance(raw_y, (int, float))
+        ):
+            return None
+        fx = float(raw_x)
+        fy = float(raw_y)
+        if not (math.isfinite(fx) and math.isfinite(fy)):
+            return None
+        raw_mon = data.get("monitor", 0)
+        if isinstance(raw_mon, bool) or not isinstance(raw_mon, int):
+            return None
+        mon = min(max(raw_mon, 0), MAX_MONITOR_INDEX)
+        return MoveAbsMessage(
+            x=min(max(fx, 0.0), 1.0),
+            y=min(max(fy, 0.0), 1.0),
+            monitor=mon,
+        )
 
     if msg_type == "btn":
         btn = data.get("b")
@@ -265,6 +336,89 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
         if not isinstance(enable, bool):
             return None
         return VolumeSyncMessage(enable=enable)
+
+    if msg_type == "screen_start":
+        quality = data.get("quality", "auto")
+        if not isinstance(quality, str) or quality.strip().lower() not in VALID_SCREEN_QUALITIES:
+            quality = "auto"
+        else:
+            quality = quality.strip().lower()
+        raw_fps = data.get("fps", 20)
+        if isinstance(raw_fps, bool) or not isinstance(raw_fps, int):
+            fps = 20
+        else:
+            fps = min(max(raw_fps, 1), MAX_SCREEN_FPS)
+        raw_w = data.get("max_width", 1280)
+        if isinstance(raw_w, bool) or not isinstance(raw_w, int):
+            max_width = 1280
+        else:
+            max_width = min(max(raw_w, MIN_SCREEN_WIDTH), MAX_SCREEN_WIDTH)
+        raw_mon = data.get("monitor", 0)
+        if isinstance(raw_mon, bool) or not isinstance(raw_mon, int):
+            monitor = 0
+        else:
+            monitor = min(max(raw_mon, 0), MAX_MONITOR_INDEX)
+        raw_p2p = data.get("prefer_p2p", True)
+        prefer_p2p = raw_p2p if isinstance(raw_p2p, bool) else True
+        raw_hide_cursor = data.get("hide_cursor", False)
+        hide_cursor = raw_hide_cursor if isinstance(raw_hide_cursor, bool) else False
+        return ScreenStartMessage(
+            quality=quality,
+            fps=fps,
+            max_width=max_width,
+            monitor=monitor,
+            prefer_p2p=prefer_p2p,
+            hide_cursor=hide_cursor,
+        )
+
+    if msg_type == "screen_stop":
+        return ScreenStopMessage()
+
+    if msg_type == "screen_cfg":
+        quality: str | None = None
+        if "quality" in data:
+            q = data.get("quality")
+            if isinstance(q, str) and q.strip().lower() in VALID_SCREEN_QUALITIES:
+                quality = q.strip().lower()
+        fps: int | None = None
+        if "fps" in data:
+            raw_fps = data.get("fps")
+            if not isinstance(raw_fps, bool) and isinstance(raw_fps, int):
+                fps = min(max(raw_fps, 1), MAX_SCREEN_FPS)
+        max_width: int | None = None
+        if "max_width" in data:
+            raw_w = data.get("max_width")
+            if not isinstance(raw_w, bool) and isinstance(raw_w, int):
+                max_width = min(max(raw_w, MIN_SCREEN_WIDTH), MAX_SCREEN_WIDTH)
+        monitor: int | None = None
+        if "monitor" in data:
+            raw_mon = data.get("monitor")
+            if not isinstance(raw_mon, bool) and isinstance(raw_mon, int):
+                monitor = min(max(raw_mon, 0), MAX_MONITOR_INDEX)
+        prefer_p2p: bool | None = None
+        if "prefer_p2p" in data:
+            raw_p2p = data.get("prefer_p2p")
+            if isinstance(raw_p2p, bool):
+                prefer_p2p = raw_p2p
+        hide_cursor: bool | None = None
+        if "hide_cursor" in data:
+            raw_hide_cursor = data.get("hide_cursor")
+            if isinstance(raw_hide_cursor, bool):
+                hide_cursor = raw_hide_cursor
+        return ScreenConfigMessage(
+            quality=quality,
+            fps=fps,
+            max_width=max_width,
+            monitor=monitor,
+            prefer_p2p=prefer_p2p,
+            hide_cursor=hide_cursor,
+        )
+
+    if msg_type == "screen_ack":
+        raw_seq = data.get("seq")
+        if isinstance(raw_seq, bool) or not isinstance(raw_seq, int) or raw_seq < 0:
+            return None
+        return ScreenAckMessage(seq=raw_seq & 0xFFFFFFFF)
 
     if msg_type == "hello":
         version = data.get("v", PROTOCOL_VERSION)

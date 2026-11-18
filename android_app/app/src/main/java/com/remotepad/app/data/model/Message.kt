@@ -44,6 +44,47 @@ data class MoveMessage(
 )
 
 @Serializable
+data class MoveAbsMessage(
+    val t: String = "move_abs",
+    val x: Float,
+    val y: Float,
+    val monitor: Int = 0,
+)
+
+@Serializable
+data class ScreenStartMessage(
+    val t: String = "screen_start",
+    val quality: String = "auto",
+    val fps: Int = 20,
+    val max_width: Int = 1280,
+    val monitor: Int = 0,
+    val prefer_p2p: Boolean = true,
+    val hide_cursor: Boolean = false,
+)
+
+@Serializable
+data class ScreenStopMessage(
+    val t: String = "screen_stop",
+)
+
+@Serializable
+data class ScreenConfigMessage(
+    val t: String = "screen_cfg",
+    val quality: String? = null,
+    val fps: Int? = null,
+    val max_width: Int? = null,
+    val monitor: Int? = null,
+    val prefer_p2p: Boolean? = null,
+    val hide_cursor: Boolean? = null,
+)
+
+@Serializable
+data class ScreenAckMessage(
+    val t: String = "screen_ack",
+    val seq: Int,
+)
+
+@Serializable
 data class ButtonMessage(
     val t: String = "btn",
     val b: String,

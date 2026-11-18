@@ -1,12 +1,22 @@
 package com.remotepad.app
 
+import android.Manifest
+import android.app.Activity
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -36,6 +46,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -48,6 +59,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.remotepad.app.ui.files.FileTransferScreen
 import com.remotepad.app.ui.files.FileTransferViewModel
 import com.remotepad.app.ui.files.TransferStatus
+import com.remotepad.app.ui.screen.RemoteScreenView
+import com.remotepad.app.ui.screen.RemoteScreenViewModel
+import com.remotepad.app.ui.screen.ScreenTabIcon
 import com.remotepad.app.ui.theme.RemoteColors
 import com.remotepad.app.ui.theme.RemotePadTheme
 import com.remotepad.app.ui.touchpad.FolderTabIcon
@@ -58,16 +72,35 @@ import com.remotepad.app.ui.touchpad.VolumeMediaModal
 
 private enum class AppPage {
     TOUCHPAD,
+    SCREEN,
     FILES,
 }
 
 class MainActivity : ComponentActivity() {
     private val touchpadVm: TouchpadViewModel by viewModels()
 
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { _ ->
+        // Foreground service works either way; permission only controls notification visibility on Android 13+
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
+        touchpadVm.onAppOpened(isFreshLaunch = savedInstanceState == null)
 
         setContent {
             RemotePadTheme {
@@ -96,6 +129,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
     val fileVm: FileTransferViewModel = viewModel()
+    val screenVm: RemoteScreenViewModel = viewModel()
 
     val connectionState by touchpadVm.connectionState.collectAsStateWithLifecycle()
     val isKeyboardOpen by touchpadVm.isKeyboardOpen.collectAsStateWithLifecycle()
@@ -106,15 +140,47 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
     val activeTransfers = transfers.count { it.status == TransferStatus.RUNNING }
 
     var currentPage by rememberSaveable { mutableStateOf(AppPage.TOUCHPAD) }
+    var screenLandscape by rememberSaveable { mutableStateOf(false) }
+    var screenFullscreen by rememberSaveable { mutableStateOf(false) }
+
     val keyboardController = LocalSoftwareKeyboardController.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val activity = LocalContext.current as? Activity
 
-    // Pause gyroscope sensor & volume sync cleanly when app is backgrounded
+    val effectiveLandscape = currentPage == AppPage.SCREEN && screenLandscape
+    val effectiveFullscreen = currentPage == AppPage.SCREEN && (screenFullscreen || screenLandscape)
+
+    // Apply orientation + immersive system bars cleanly when switching Screen / Rotate / Fullscreen
+    LaunchedEffect(effectiveLandscape, effectiveFullscreen) {
+        val act = activity ?: return@LaunchedEffect
+        act.requestedOrientation = if (effectiveLandscape) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+        val window = act.window
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (effectiveFullscreen) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    // Pause gyroscope sensor, volume sync & screen stream cleanly when app is backgrounded
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> touchpadVm.setAppInForeground(true)
-                Lifecycle.Event.ON_PAUSE -> touchpadVm.setAppInForeground(false)
+                Lifecycle.Event.ON_RESUME -> {
+                    touchpadVm.setAppInForeground(true)
+                    screenVm.setAppInForeground(true)
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    touchpadVm.setAppInForeground(false)
+                    screenVm.setAppInForeground(false)
+                }
                 else -> Unit
             }
         }
@@ -122,6 +188,7 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
             touchpadVm.setAppInForeground(false)
+            screenVm.setAppInForeground(false)
         }
     }
 
@@ -135,9 +202,13 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .safeDrawingPadding(),
+                modifier = if (effectiveFullscreen) {
+                    Modifier.fillMaxSize()
+                } else {
+                    Modifier
+                        .fillMaxSize()
+                        .safeDrawingPadding()
+                },
             ) {
                 Box(
                     modifier = Modifier
@@ -148,6 +219,31 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
                         AppPage.TOUCHPAD -> {
                             TouchpadScreen(
                                 viewModel = touchpadVm,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                        AppPage.SCREEN -> {
+                            RemoteScreenView(
+                                screenVm = screenVm,
+                                touchpadVm = touchpadVm,
+                                isLandscape = screenLandscape,
+                                isFullscreen = effectiveFullscreen,
+                                onToggleOrientation = {
+                                    screenLandscape = !screenLandscape
+                                },
+                                onToggleFullscreen = {
+                                    if (screenLandscape) {
+                                        screenLandscape = false
+                                        screenFullscreen = false
+                                    } else {
+                                        screenFullscreen = !screenFullscreen
+                                    }
+                                },
+                                onGoToTouchpad = {
+                                    screenLandscape = false
+                                    screenFullscreen = false
+                                    currentPage = AppPage.TOUCHPAD
+                                },
                                 modifier = Modifier.fillMaxSize(),
                             )
                         }
@@ -162,16 +258,21 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
                     }
                 }
 
-                // Sleek Bottom Navigation Bar (matching screenshots, ad-free, hidden while typing)
-                if (!(currentPage == AppPage.TOUCHPAD && isKeyboardOpen)) {
+                // Sleek Bottom Navigation Bar (hidden while typing on Touchpad or in Fullscreen/Landscape Screen)
+                val showBottomBar = !effectiveFullscreen && !(currentPage == AppPage.TOUCHPAD && isKeyboardOpen)
+                if (showBottomBar) {
                     BottomNavBar(
                         currentPage = currentPage,
                         activeTransfers = activeTransfers,
                         onSelectPage = { page ->
                             if (page != currentPage) {
-                                if (page == AppPage.FILES) {
+                                if (page != AppPage.TOUCHPAD) {
                                     touchpadVm.setKeyboardOpen(false)
                                     keyboardController?.hide()
+                                }
+                                if (page != AppPage.SCREEN) {
+                                    screenLandscape = false
+                                    screenFullscreen = false
                                 }
                                 currentPage = page
                             }
@@ -228,6 +329,15 @@ private fun BottomNavBar(
                 onClick = { onSelectPage(AppPage.TOUCHPAD) },
             ) { color ->
                 MouseTabIcon(color = color, modifier = Modifier.size(22.dp))
+            }
+
+            BottomNavItem(
+                label = "Screen",
+                selected = currentPage == AppPage.SCREEN,
+                modifier = Modifier.weight(1f),
+                onClick = { onSelectPage(AppPage.SCREEN) },
+            ) { color ->
+                ScreenTabIcon(color = color, modifier = Modifier.size(22.dp))
             }
 
             val filesLabel = if (activeTransfers > 0) "Files ($activeTransfers)" else "Files"

@@ -9,16 +9,20 @@ from pathlib import Path
 
 import pytest
 
-from config import AgentConfig
+from config import AgentConfig, sync_config_to_shared
 from core.runtime import AgentRuntime, generate_relay_token, validate_relay_settings
+from core.service_ipc import RemoteAgentProxy, ServiceIpcServer
 from core.windows_integration import (
     SingleInstanceGuard,
     build_autostart_task_xml,
+    build_boot_service_task_xml,
     get_resource_path,
     is_admin,
     is_autostart_enabled,
+    is_system,
     set_autostart_enabled,
 )
+from input.keyboard import _encode_ascii_vk_inputs
 
 
 def test_validate_relay_settings_valid_cases() -> None:
@@ -171,3 +175,147 @@ def test_windows_autostart_registry_roundtrip() -> None:
         assert is_autostart_enabled(value_name=test_val_name) is False
     finally:
         set_autostart_enabled(False, value_name=test_val_name)
+
+
+def test_build_boot_service_task_xml_is_valid_system_boot_task() -> None:
+    import xml.etree.ElementTree as ET
+
+    xml_str = build_boot_service_task_xml(
+        executable=r"C:\Program Files\RemotePad\RemotePad.exe",
+        arguments="--service-supervisor",
+    )
+    root = ET.fromstring(xml_str)
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    assert root.find(".//t:Triggers/t:BootTrigger", namespaces=ns) is not None
+    assert root.findtext(".//t:Triggers/t:BootTrigger/t:Enabled", namespaces=ns) == "true"
+    assert root.findtext(".//t:Principal/t:UserId", namespaces=ns) == "S-1-5-18"
+    assert root.findtext(".//t:RunLevel", namespaces=ns) == "HighestAvailable"
+    assert root.findtext(".//t:DisallowStartIfOnBatteries", namespaces=ns) == "false"
+    assert root.findtext(".//t:StopIfGoingOnBatteries", namespaces=ns) == "false"
+    assert root.findtext(".//t:ExecutionTimeLimit", namespaces=ns) == "PT0S"
+    assert root.findtext(".//t:RestartOnFailure/t:Interval", namespaces=ns) == "PT1M"
+    assert root.findtext(".//t:RestartOnFailure/t:Count", namespaces=ns) == "3"
+    assert root.findtext(".//t:Command", namespaces=ns) == r"C:\Program Files\RemotePad\RemotePad.exe"
+    assert root.findtext(".//t:Arguments", namespaces=ns) == "--service-supervisor"
+    assert isinstance(is_system(), bool)
+
+
+def test_service_ipc_server_and_proxy_roundtrip(tmp_path: Path) -> None:
+    config_file = tmp_path / "shared_config.json"
+    state_file = tmp_path / "service_ipc.json"
+    shutdown_called = threading.Event()
+
+    cfg = AgentConfig(
+        host="127.0.0.1",
+        port=0,
+        discovery_enabled=False,
+        file_transfer_enabled=False,
+        mic_enabled=False,
+        relay_enabled=False,
+        relay_url="ws://127.0.0.1:19999",
+        relay_device_id="boot-pc",
+        relay_token="rpad-boot12345678",
+    )
+    runtime = AgentRuntime(cfg, config_path=config_file)
+    runtime.start(timeout=5.0)
+    ipc = ServiceIpcServer(
+        runtime=runtime,
+        state_path=state_file,
+        on_shutdown_requested=shutdown_called.set,
+        running_as_system=True,
+    )
+    ipc.start(timeout=5.0)
+    try:
+        assert state_file.exists()
+        assert ipc.port > 0
+
+        proxy = RemoteAgentProxy.connect(state_path=state_file, timeout=2.0)
+        assert proxy is not None
+        assert proxy.is_service_backed is True
+        assert proxy.running_as_system is True
+
+        st1 = proxy.get_status()
+        assert st1.running is True
+        assert st1.ws_port > 0
+        assert st1.relay_device_id == "boot-pc"
+        assert st1.relay_state == "disabled"
+
+        # Update relay settings via IPC -> persisted and live in runtime
+        proxy.update_relay_settings(
+            relay_enabled=True,
+            relay_url="ws://127.0.0.1:19997",
+            relay_device_id="boot-pc-updated",
+            relay_token="rpad-abcdef1234567890",
+            persist=True,
+        )
+        reloaded = AgentConfig.load(config_file)
+        assert reloaded.relay_device_id == "boot-pc-updated"
+        assert reloaded.relay_enabled is True
+        assert proxy.get_status().relay_device_id == "boot-pc-updated"
+
+        # Validation error propagates as ValueError
+        with pytest.raises(ValueError):
+            proxy.update_relay_settings(
+                relay_enabled=True,
+                relay_url="http://invalid-scheme",
+                relay_device_id="boot-pc-updated",
+                relay_token="rpad-abcdef1234567890",
+                persist=True,
+            )
+
+        # Reconnect command succeeds
+        proxy.reconnect_relay()
+
+        # Bad token is rejected
+        bad_proxy = RemoteAgentProxy(
+            host="127.0.0.1",
+            port=ipc.port,
+            token="wrong-token",
+            state_path=tmp_path / "missing.json",
+        )
+        with pytest.raises(RuntimeError):
+            bad_proxy._fetch_status(timeout=1.0)
+
+        # proxy.stop() detaches tray without stopping the background service
+        proxy.stop()
+        assert not shutdown_called.is_set()
+
+        # Explicit shutdown_service() signals shutdown callback
+        assert proxy.shutdown_service(timeout=2.0) is True
+        assert shutdown_called.wait(timeout=2.0) is True
+    finally:
+        ipc.stop(timeout=3.0)
+        runtime.stop(timeout=5.0)
+    assert not state_file.exists()
+
+
+def test_sync_config_to_shared_copies_user_config(tmp_path: Path) -> None:
+    user_cfg = tmp_path / "user" / "config.json"
+    shared_cfg = tmp_path / "shared" / "config.json"
+
+    cfg = AgentConfig(relay_device_id="my-lockscreen-pc", relay_token="rpad-9999888877776666")
+    cfg.save(user_cfg)
+
+    sync_config_to_shared(user_path=user_cfg, shared_path=shared_cfg)
+    assert shared_cfg.exists()
+    loaded = AgentConfig.load(shared_cfg)
+    assert loaded.relay_device_id == "my-lockscreen-pc"
+    assert loaded.relay_token == "rpad-9999888877776666"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only VkKeyScanW test")
+def test_winlogon_ascii_vk_encoding() -> None:
+    digit_events = _encode_ascii_vk_inputs("5")
+    assert digit_events is not None
+    assert len(digit_events) == 2
+    assert digit_events[0].ki.wVk == 0x35
+
+    upper_events = _encode_ascii_vk_inputs("A")
+    assert upper_events is not None
+    # Shift down, A down, A up, Shift up
+    assert len(upper_events) == 4
+    assert upper_events[0].ki.wVk == 0xA0
+    assert upper_events[1].ki.wVk == 0x41
+
+    # Non-ASCII Bangla falls back to KEYEVENTF_UNICODE (returns None here)
+    assert _encode_ascii_vk_inputs("অ") is None

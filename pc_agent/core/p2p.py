@@ -51,6 +51,16 @@ PKT_MOVE = 0x03
 PKT_SCROLL = 0x04
 PKT_KEEPALIVE = 0x05
 PKT_KEEPALIVE_ACK = 0x06
+PKT_SCREEN_CHUNK = 0x20
+PKT_SCREEN_ACK = 0x21
+
+SCREEN_CHUNK_HEADER_STRUCT = struct.Struct(">4sB3s8sIHH")
+SCREEN_CHUNK_HEADER_SIZE = SCREEN_CHUNK_HEADER_STRUCT.size  # 24 bytes
+SCREEN_CHUNK_PAYLOAD_MAX = 1120  # 24 + 1120 = 1144 bytes UDP (safe under 1280/1400/1492 mobile & PPPoE MTU)
+SCREEN_MAX_CHUNKS = 320
+SCREEN_PACE_BURST_PACKETS = 8
+SCREEN_PACE_DELAY_S = 0.001
+SCREEN_PACE_MAX_TOTAL_S = 0.012
 
 _SEQ_WINDOW = 64
 
@@ -81,6 +91,38 @@ def unpack_packet(data: bytes) -> tuple[int, bytes, int, bytes] | None:
         return None
     _magic, pkt_type, _reserved, auth_tag, seq = _HEADER_STRUCT.unpack_from(data, 0)
     return pkt_type, auth_tag, seq, data[20:28]
+
+
+def pack_screen_chunk(
+    auth_tag: bytes,
+    frame_seq: int,
+    chunk_idx: int,
+    total_chunks: int,
+    chunk_payload: bytes,
+) -> bytes:
+    """Pack a variable-length P2P screen chunk datagram (24-byte header + payload)."""
+    return (
+        SCREEN_CHUNK_HEADER_STRUCT.pack(
+            P2P_MAGIC,
+            PKT_SCREEN_CHUNK,
+            b"\x00\x00\x00",
+            auth_tag[:8],
+            frame_seq & 0xFFFFFFFF,
+            chunk_idx & 0xFFFF,
+            total_chunks & 0xFFFF,
+        )
+        + chunk_payload
+    )
+
+
+def unpack_screen_chunk(data: bytes) -> tuple[bytes, int, int, int, bytes] | None:
+    """Unpack a P2P screen chunk datagram into (auth_tag, frame_seq, chunk_idx, total_chunks, payload)."""
+    if len(data) < SCREEN_CHUNK_HEADER_SIZE or data[:4] != P2P_MAGIC or data[4] != PKT_SCREEN_CHUNK:
+        return None
+    _magic, _type, _res, auth_tag, frame_seq, chunk_idx, total_chunks = SCREEN_CHUNK_HEADER_STRUCT.unpack_from(data, 0)
+    if total_chunks < 1 or chunk_idx >= total_chunks:
+        return None
+    return auth_tag, frame_seq, chunk_idx, total_chunks, data[SCREEN_CHUNK_HEADER_SIZE:]
 
 
 def parse_relay_host_and_udp_port(relay_url: str, explicit_udp_port: int | None = None) -> tuple[str, int] | None:
@@ -176,6 +218,7 @@ class P2PUdpEndpoint:
         on_move: Callable[[float, float], None],
         on_scroll: Callable[[float, float], None],
         file_handler: Any | None = None,
+        on_screen_ack: Callable[[int], None] | None = None,
         bind_host: str = "0.0.0.0",
         bind_port: int = 0,
     ) -> None:
@@ -183,6 +226,7 @@ class P2PUdpEndpoint:
         self._on_move = on_move
         self._on_scroll = on_scroll
         self._file_handler = file_handler
+        self._on_screen_ack = on_screen_ack
         self._bind_host = bind_host
         self._bind_port = bind_port
 
@@ -226,8 +270,8 @@ class P2PUdpEndpoint:
         sock = transport.get_extra_info("socket")
         if sock is not None:
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
             except OSError:
                 pass
             self._local_port = int(sock.getsockname()[1])
@@ -493,6 +537,96 @@ class P2PUdpEndpoint:
                 if not self._p2p_active:
                     self._p2p_active = True
                 self._on_scroll(cdx, cdy)
+        elif pkt_type == PKT_SCREEN_ACK:
+            if not self._p2p_active:
+                self._p2p_active = True
+            cb = self._on_screen_ack
+            if cb is not None:
+                cb(seq)
+
+    def set_screen_ack_callback(self, callback: Callable[[int], None] | None) -> None:
+        self._on_screen_ack = callback
+
+    def send_screen_frame(self, wire_frame: bytes) -> bool:
+        """Fragment an RSCR binary screen frame into MTU-safe P2P UDP chunks and transmit directly."""
+        if (
+            not self._p2p_active
+            or self._transport is None
+            or self._transport.is_closing()
+            or self._peer_addr is None
+            or not self._auth_tag
+            or len(wire_frame) < 20
+        ):
+            return False
+
+        frame_seq = struct.unpack_from(">I", wire_frame, 8)[0]
+        total_len = len(wire_frame)
+        total_chunks = (total_len + SCREEN_CHUNK_PAYLOAD_MAX - 1) // SCREEN_CHUNK_PAYLOAD_MAX
+        if total_chunks < 1 or total_chunks > SCREEN_MAX_CHUNKS:
+            return False
+
+        peer = self._peer_addr
+        auth_tag = self._auth_tag
+        try:
+            for idx in range(total_chunks):
+                start = idx * SCREEN_CHUNK_PAYLOAD_MAX
+                chunk = wire_frame[start : start + SCREEN_CHUNK_PAYLOAD_MAX]
+                pkt = pack_screen_chunk(auth_tag, frame_seq, idx, total_chunks, chunk)
+                self._transport.sendto(pkt, peer)
+            return True
+        except OSError:
+            return False
+
+    async def send_screen_frame_paced(
+        self,
+        wire_frame: bytes,
+        *,
+        burst_packets: int = SCREEN_PACE_BURST_PACKETS,
+        burst_delay_s: float = SCREEN_PACE_DELAY_S,
+        max_total_pace_s: float = SCREEN_PACE_MAX_TOTAL_S,
+    ) -> bool:
+        """Fragment an RSCR frame into MTU-safe UDP chunks and send in small paced bursts.
+
+        Pacing prevents saturating home router / ISP / 4G NAT UDP buffers that otherwise drop
+        single packets out of large back-to-back bursts and force VPS fallback.
+        """
+        if (
+            not self._p2p_active
+            or self._transport is None
+            or self._transport.is_closing()
+            or self._peer_addr is None
+            or not self._auth_tag
+            or len(wire_frame) < 20
+        ):
+            return False
+
+        frame_seq = struct.unpack_from(">I", wire_frame, 8)[0]
+        total_len = len(wire_frame)
+        total_chunks = (total_len + SCREEN_CHUNK_PAYLOAD_MAX - 1) // SCREEN_CHUNK_PAYLOAD_MAX
+        if total_chunks < 1 or total_chunks > SCREEN_MAX_CHUNKS:
+            return False
+
+        burst = max(int(burst_packets), 1)
+        peer = self._peer_addr
+        auth_tag = self._auth_tag
+        pace_deadline = time.monotonic() + max(max_total_pace_s, 0.0)
+        try:
+            for idx in range(total_chunks):
+                transport = self._transport
+                if not self._p2p_active or transport is None or transport.is_closing():
+                    return False
+                start = idx * SCREEN_CHUNK_PAYLOAD_MAX
+                chunk = wire_frame[start : start + SCREEN_CHUNK_PAYLOAD_MAX]
+                pkt = pack_screen_chunk(auth_tag, frame_seq, idx, total_chunks, chunk)
+                transport.sendto(pkt, peer)
+                if (idx + 1) < total_chunks and ((idx + 1) % burst == 0):
+                    if burst_delay_s > 0.0 and time.monotonic() < pace_deadline:
+                        await asyncio.sleep(burst_delay_s)
+                    else:
+                        await asyncio.sleep(0)
+            return True
+        except OSError:
+            return False
 
     def _send_raw_to_peer(self, raw: bytes) -> None:
         if self._transport is None or self._transport.is_closing() or self._peer_addr is None:

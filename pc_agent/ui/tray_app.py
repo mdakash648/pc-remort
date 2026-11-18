@@ -13,7 +13,7 @@ from typing import Any
 import pystray
 from PIL import Image, ImageDraw, ImageTk
 
-from config import get_config_dir
+from config import get_config_dir, get_shared_config_dir
 from core.runtime import AgentRuntime, AgentStatus, generate_relay_token, validate_relay_settings
 from core.windows_integration import (
     enable_high_dpi_awareness,
@@ -22,6 +22,7 @@ from core.windows_integration import (
     is_autostart_enabled,
     open_folder_in_explorer,
     relaunch_as_admin,
+    run_elevated_flag,
     set_app_user_model_id,
     set_autostart_enabled,
 )
@@ -94,11 +95,15 @@ class RemotePadTrayApp:
 
     _POLL_INTERVAL_MS = 1500
 
-    def __init__(self, runtime: AgentRuntime, start_minimized: bool = False) -> None:
+    def __init__(self, runtime: Any, start_minimized: bool = False) -> None:
         self.runtime = runtime
         self._start_minimized = start_minimized
         self._is_admin = is_admin()
+        self._is_service_backed = bool(getattr(runtime, "is_service_backed", False))
+        self._running_as_system = bool(getattr(runtime, "running_as_system", False))
+        self._has_elevated_control = self._is_admin or self._running_as_system
         self.restart_as_admin_requested = False
+        self.explicit_quit_requested = False
 
         self._root: tk.Tk | None = None
         self._tray_icon: pystray.Icon | None = None
@@ -236,7 +241,7 @@ class RemotePadTrayApp:
             font=("Segoe UI", 15, "bold"),
         ).pack(anchor="w")
 
-        priv_tag = "Admin" if self._is_admin else "Standard"
+        priv_tag = self._privilege_tag()
         self._subtitle_label = tk.Label(
             title_col,
             text=f"PC Agent  •  {status.pc_name}  •  {priv_tag}",
@@ -471,7 +476,7 @@ class RemotePadTrayApp:
 
         tk.Checkbutton(
             info_card,
-            text="Start RemotePad automatically when Windows starts",
+            text="Start automatically at Windows boot (works on Lock Screen)",
             variable=self._var_autostart,
             command=self._on_autostart_toggle,
             bg=_BG_CARD,
@@ -485,7 +490,7 @@ class RemotePadTrayApp:
             bd=0,
         ).pack(anchor="w")
 
-        if not self._is_admin:
+        if not self._has_elevated_control:
             admin_row = tk.Frame(info_card, bg=_BG_CARD)
             admin_row.pack(fill="x", pady=(8, 0))
 
@@ -511,7 +516,7 @@ class RemotePadTrayApp:
         logs_btn = tk.Button(
             footer,
             text="Open Logs Folder",
-            command=lambda: open_folder_in_explorer(get_config_dir()),
+            command=lambda: open_folder_in_explorer(self._active_logs_dir()),
             bg=_BG_ROOT,
             fg=_TEXT_SECONDARY,
             activebackground=_BG_ROOT,
@@ -526,7 +531,7 @@ class RemotePadTrayApp:
         quit_btn = tk.Button(
             footer,
             text="Quit Agent",
-            command=self._quit_on_main_thread,
+            command=self._on_user_quit_clicked,
             bg=_DANGER,
             fg="#FFFFFF",
             activebackground=_DANGER_HOVER,
@@ -680,13 +685,13 @@ class RemotePadTrayApp:
                 checked=lambda _item: is_autostart_enabled(),
             ),
         ]
-        if not self._is_admin:
+        if not self._has_elevated_control:
             items.append(pystray.MenuItem("Restart as Admin", self._tray_on_restart_as_admin))
         items.extend(
             [
                 pystray.MenuItem(
                     "Open Logs Folder",
-                    lambda _icon, _item: open_folder_in_explorer(get_config_dir()),
+                    lambda _icon, _item: open_folder_in_explorer(self._active_logs_dir()),
                 ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit RemotePad", self._tray_on_quit),
@@ -721,15 +726,34 @@ class RemotePadTrayApp:
     def _tray_on_reconnect(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         threading.Thread(target=self._reconnect_background, daemon=True).start()
 
+    def _privilege_tag(self) -> str:
+        if self._running_as_system:
+            return "System Service"
+        if self._is_admin:
+            return "Admin"
+        return "Standard"
+
+    def _active_logs_dir(self) -> Path:
+        return get_shared_config_dir() if self._is_service_backed else get_config_dir()
+
+    def _apply_autostart_change(self, desired: bool) -> bool:
+        if is_admin() or sys.platform != "win32":
+            return set_autostart_enabled(desired)
+        return run_elevated_flag("--install-autostart" if desired else "--remove-autostart")
+
     def _tray_on_toggle_autostart(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         new_val = not is_autostart_enabled()
-        set_autostart_enabled(new_val)
+        self._apply_autostart_change(new_val)
         root = self._root
         if root is not None and not self._shutting_down:
             root.after(0, lambda: self._var_autostart.set(is_autostart_enabled()))
 
     def _tray_on_quit(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        self.request_quit()
+        self._post_to_ui(self._on_user_quit_clicked)
+
+    def _on_user_quit_clicked(self) -> None:
+        self.explicit_quit_requested = True
+        self._quit_on_main_thread()
 
     def _tray_on_restart_as_admin(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         self._post_to_ui(self._on_restart_as_admin_clicked)
@@ -795,14 +819,18 @@ class RemotePadTrayApp:
 
     def _on_autostart_toggle(self) -> None:
         desired = bool(self._var_autostart.get())
-        ok = set_autostart_enabled(desired)
+        ok = self._apply_autostart_change(desired)
         actual = is_autostart_enabled()
         self._var_autostart.set(actual)
         if ok:
-            msg = "Auto-startup enabled." if actual else "Auto-startup disabled."
+            msg = (
+                "Boot auto-startup enabled (works on Lock Screen)."
+                if actual
+                else "Auto-startup disabled."
+            )
             self._set_feedback(msg, _SUCCESS, auto_clear_ms=3000)
         else:
-            self._set_feedback("Could not update Windows Startup registry setting.", _ERROR)
+            self._set_feedback("Could not update Windows Startup setting.", _ERROR)
         if self._tray_icon is not None:
             try:
                 self._tray_icon.update_menu()
@@ -918,7 +946,7 @@ class RemotePadTrayApp:
                 self._root.after(self._POLL_INTERVAL_MS, self._poll_status)
 
     def _apply_status_to_widgets(self, status: AgentStatus) -> None:
-        priv_tag = "Admin" if self._is_admin else "Standard"
+        priv_tag = self._privilege_tag()
         self._subtitle_label.configure(text=f"PC Agent  •  {status.pc_name}  •  {priv_tag}")
 
         if status.relay_state == "p2p_active":

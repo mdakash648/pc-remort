@@ -139,10 +139,13 @@ fun TouchpadScreen(
         val err = micError
         if (!err.isNullOrBlank()) {
             Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
+            viewModel.clearMicError()
         }
     }
 
-    var activePanel by rememberSaveable { mutableStateOf(ControlPanelTab.CONNECTION) }
+    var activePanel by rememberSaveable {
+        mutableStateOf(if (isConnected) ControlPanelTab.NONE else ControlPanelTab.CONNECTION)
+    }
 
     // Sync PC volume ONLY while the Media panel is actively open on screen
     LaunchedEffect(activePanel) {
@@ -271,6 +274,10 @@ fun TouchpadScreen(
                     onConnectRelay = {
                         keyboardController?.hide()
                         viewModel.connectViaRelay()
+                    },
+                    onReconnectWifiFirst = {
+                        keyboardController?.hide()
+                        viewModel.reconnectWifiFirst()
                     },
                     onDisconnect = {
                         viewModel.setKeyboardOpen(false)
@@ -667,6 +674,7 @@ private fun ConnectionDrawerPanel(
     onSelectDiscoveredPc: (DiscoveredPc) -> Unit,
     onConnect: () -> Unit,
     onConnectRelay: () -> Unit,
+    onReconnectWifiFirst: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     var useInternetTab by rememberSaveable { mutableStateOf(false) }
@@ -720,6 +728,26 @@ private fun ConnectionDrawerPanel(
                         ),
                     ) {
                         Text("Off", fontWeight = FontWeight.SemiBold)
+                    }
+                } else if (isConnecting) {
+                    Button(
+                        onClick = onDisconnect,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = RemoteColors.TileBg,
+                            contentColor = RemoteColors.DangerRed,
+                        ),
+                    ) {
+                        Text("Stop", fontWeight = FontWeight.SemiBold)
+                    }
+                } else {
+                    Button(
+                        onClick = onReconnectWifiFirst,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = RemoteColors.TileBg,
+                            contentColor = RemoteColors.NeonCyan,
+                        ),
+                    ) {
+                        Text("Retry", fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -852,12 +880,19 @@ private fun ConnectionDrawerPanel(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text(
-                            text = "Auto-connect",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = RemoteColors.TextPrimary,
-                            fontWeight = FontWeight.Medium,
-                        )
+                        Column {
+                            Text(
+                                text = "Auto (Wi-Fi → VPS)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = RemoteColors.TextPrimary,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = "Stays connected in background",
+                                fontSize = 10.sp,
+                                color = RemoteColors.TextMuted,
+                            )
+                        }
                         Switch(
                             checked = autoConnect,
                             onCheckedChange = onAutoConnectChange,

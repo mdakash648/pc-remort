@@ -19,6 +19,7 @@ const PORT = Number(process.env.PORT || 8770);
 const UDP_PORT = Number(process.env.UDP_PORT || 8771);
 const HOST = process.env.HOST || "0.0.0.0";
 const MAX_PAYLOAD_BYTES = 512 * 1024; // 512 KB (supports multi-paragraph paste)
+const MAX_SCREEN_BUFFERED_BYTES = 64 * 1024; // Drop/coalesce stale RSCR screen frames when phone link is congested
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const REGISTER_TIMEOUT_MS = 10_000;
 
@@ -81,6 +82,41 @@ function safeSend(ws, data) {
 
 function sendJson(ws, obj) {
   safeSend(ws, JSON.stringify(obj));
+}
+
+function isScreenFrameBuffer(raw) {
+  return (
+    Buffer.isBuffer(raw) &&
+    raw.length >= 20 &&
+    raw[0] === 0x52 && // 'R'
+    raw[1] === 0x53 && // 'S'
+    raw[2] === 0x43 && // 'C'
+    raw[3] === 0x52 // 'R'
+  );
+}
+
+function forwardScreenFrame(peer, raw) {
+  if (!peer || peer.readyState !== WebSocket.OPEN) return;
+  // Latest-frame-wins backpressure: if previous frame is still flushing over a slow mobile link,
+  // hold ONLY the newest frame instead of piling up multi-second bufferbloat on the VPS.
+  if (peer.screenSendInFlight || peer.bufferedAmount > MAX_SCREEN_BUFFERED_BYTES) {
+    peer.pendingScreenFrame = raw;
+    return;
+  }
+  peer.screenSendInFlight = true;
+  try {
+    peer.send(raw, { binary: true }, () => {
+      peer.screenSendInFlight = false;
+      const next = peer.pendingScreenFrame;
+      if (next && peer.readyState === WebSocket.OPEN) {
+        peer.pendingScreenFrame = null;
+        forwardScreenFrame(peer, next);
+      }
+    });
+  } catch {
+    peer.screenSendInFlight = false;
+    peer.pendingScreenFrame = null;
+  }
 }
 
 function isValidDeviceId(id) {
@@ -156,7 +192,11 @@ wss.on("connection", (ws, req) => {
 
     const peer = ws.role === "host" ? room.controllerWs : room.hostWs;
     if (peer && peer.readyState === WebSocket.OPEN) {
-      safeSend(peer, isBinary ? raw : raw.toString("utf8"));
+      if (isBinary && ws.role === "host" && isScreenFrameBuffer(raw)) {
+        forwardScreenFrame(peer, raw);
+      } else {
+        safeSend(peer, isBinary ? raw : raw.toString("utf8"));
+      }
     }
   });
 
@@ -287,6 +327,8 @@ function handleRegister(ws, raw, ip) {
 }
 
 function cleanupConnection(ws) {
+  ws.pendingScreenFrame = null;
+  ws.screenSendInFlight = false;
   if (!ws.registered || !ws.deviceId) return;
   const room = rooms.get(ws.deviceId);
   if (!room) return;

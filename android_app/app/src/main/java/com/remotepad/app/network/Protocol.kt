@@ -17,6 +17,10 @@ import com.remotepad.app.data.model.PasteMessage
 import com.remotepad.app.data.model.PingMessage
 import com.remotepad.app.data.model.PowerMessage
 import com.remotepad.app.data.model.RelayRegisterMessage
+import com.remotepad.app.data.model.ScreenAckMessage
+import com.remotepad.app.data.model.ScreenConfigMessage
+import com.remotepad.app.data.model.ScreenStartMessage
+import com.remotepad.app.data.model.ScreenStopMessage
 import com.remotepad.app.data.model.TextMessage
 import com.remotepad.app.data.model.VolumeSyncMessage
 import kotlinx.serialization.encodeToString
@@ -45,6 +49,53 @@ object Protocol {
         val rdy = round2(dy)
         return "{\"t\":\"move\",\"dx\":$rdx,\"dy\":$rdy}"
     }
+
+    fun encodeMoveAbs(normX: Float, normY: Float, monitor: Int = 0): String {
+        val cx = round4(normX.coerceIn(0f, 1f))
+        val cy = round4(normY.coerceIn(0f, 1f))
+        val mon = monitor.coerceAtLeast(0)
+        return "{\"t\":\"move_abs\",\"x\":$cx,\"y\":$cy,\"monitor\":$mon}"
+    }
+
+    fun encodeScreenStart(
+        quality: String = "auto",
+        fps: Int = 20,
+        maxWidth: Int = 1280,
+        monitor: Int = 0,
+        preferP2p: Boolean = true,
+        hideCursor: Boolean = false,
+    ): String = json.encodeToString(
+        ScreenStartMessage(
+            quality = quality,
+            fps = fps.coerceIn(1, 30),
+            max_width = maxWidth.coerceIn(320, 1920),
+            monitor = monitor.coerceAtLeast(0),
+            prefer_p2p = preferP2p,
+            hide_cursor = hideCursor,
+        )
+    )
+
+    fun encodeScreenStop(): String = json.encodeToString(ScreenStopMessage())
+
+    fun encodeScreenConfig(
+        quality: String? = null,
+        fps: Int? = null,
+        maxWidth: Int? = null,
+        monitor: Int? = null,
+        preferP2p: Boolean? = null,
+        hideCursor: Boolean? = null,
+    ): String = json.encodeToString(
+        ScreenConfigMessage(
+            quality = quality,
+            fps = fps?.coerceIn(1, 30),
+            max_width = maxWidth?.coerceIn(320, 1920),
+            monitor = monitor?.coerceAtLeast(0),
+            prefer_p2p = preferP2p,
+            hide_cursor = hideCursor,
+        )
+    )
+
+    fun encodeScreenAck(seq: Int): String = json.encodeToString(ScreenAckMessage(seq = seq))
 
     fun encodeButton(button: MouseButton, state: ButtonState): String =
         json.encodeToString(ButtonMessage(b = button.wireValue, s = state.wireValue))
@@ -170,6 +221,12 @@ object Protocol {
     private fun round2(value: Float): Float {
         if (!value.isFinite()) return 0f
         val rounded = round(value * 100f) / 100f
+        return if (rounded == 0f) 0f else rounded
+    }
+
+    private fun round4(value: Float): Float {
+        if (!value.isFinite()) return 0f
+        val rounded = round(value * 10000f) / 10000f
         return if (rounded == 0f) 0f else rounded
     }
 }

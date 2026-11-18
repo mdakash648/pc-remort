@@ -8,9 +8,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -19,6 +23,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import java.net.InetAddress
 import java.net.Socket
 import java.util.concurrent.TimeUnit
@@ -97,6 +102,16 @@ class LocalClient(context: Context? = null) {
         .pingInterval(15, TimeUnit.SECONDS)
         .build()
 
+    // Fast TCP timeout on LAN so unreachable local IPs fall back to Internet (VPS) quickly;
+    // slightly more generous timeout on Internet (VPS) for 4G/5G handshakes.
+    private val lanHttpClient = httpClient.newBuilder()
+        .connectTimeout(2200, TimeUnit.MILLISECONDS)
+        .build()
+
+    private val relayHttpClient = httpClient.newBuilder()
+        .connectTimeout(6000, TimeUnit.MILLISECONDS)
+        .build()
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val p2pClient = P2PUdpClient()
 
@@ -105,6 +120,12 @@ class LocalClient(context: Context? = null) {
 
     private val _volumeState = MutableStateFlow(RemoteVolumeState())
     val volumeState: StateFlow<RemoteVolumeState> = _volumeState.asStateFlow()
+
+    private val _screenFrames = MutableSharedFlow<ScreenFramePacket>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val screenFrames: SharedFlow<ScreenFramePacket> = _screenFrames.asSharedFlow()
 
     @Volatile
     private var socket: WebSocket? = null
@@ -115,6 +136,9 @@ class LocalClient(context: Context? = null) {
     private var wifiLock: WifiManager.WifiLock? = null
 
     init {
+        p2pClient.onScreenFrame = { frame ->
+            _screenFrames.tryEmit(frame)
+        }
         scope.launch {
             p2pClient.state.collect { p2pState ->
                 val current = _state.value
@@ -142,7 +166,7 @@ class LocalClient(context: Context? = null) {
     }
 
     fun connect(host: String, port: Int) {
-        disconnect()
+        closeActiveSocket()
 
         val cleanHost = host.trim()
         if (cleanHost.isEmpty()) {
@@ -155,11 +179,11 @@ class LocalClient(context: Context? = null) {
         }
 
         val url = "ws://$cleanHost:$port"
-        currentTarget = "$cleanHost:$port"
+        currentTarget = "Wi-Fi ($cleanHost:$port)"
         _state.value = ConnectionState.Connecting(currentTarget)
 
         val request = Request.Builder().url(url).build()
-        socket = httpClient.newWebSocket(request, object : WebSocketListener() {
+        socket = lanHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (socket !== webSocket) return
                 acquireLowLatencyWifiLock()
@@ -209,6 +233,13 @@ class LocalClient(context: Context? = null) {
                 }
             }
 
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (socket !== webSocket) return
+                val raw = bytes.toByteArray()
+                val frame = ScreenFrameWire.decode(raw, raw.size, fromP2p = false) ?: return
+                _screenFrames.tryEmit(frame)
+            }
+
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 if (socket !== webSocket) return
                 webSocket.close(1000, null)
@@ -234,7 +265,7 @@ class LocalClient(context: Context? = null) {
     }
 
     fun connectRelay(relayUrl: String, deviceId: String, token: String) {
-        disconnect()
+        closeActiveSocket()
 
         val cleanUrl = relayUrl.trim()
         val cleanId = deviceId.trim()
@@ -261,7 +292,7 @@ class LocalClient(context: Context? = null) {
             return
         }
 
-        socket = httpClient.newWebSocket(request, object : WebSocketListener() {
+        socket = relayHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (socket !== webSocket) return
                 acquireLowLatencyWifiLock()
@@ -337,6 +368,13 @@ class LocalClient(context: Context? = null) {
                 }
             }
 
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (socket !== webSocket) return
+                val raw = bytes.toByteArray()
+                val frame = ScreenFrameWire.decode(raw, raw.size, fromP2p = false) ?: return
+                _screenFrames.tryEmit(frame)
+            }
+
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 if (socket !== webSocket) return
                 webSocket.close(1000, null)
@@ -390,18 +428,55 @@ class LocalClient(context: Context? = null) {
         return send(Protocol.encodeScroll(dx, dy))
     }
 
+    fun sendMoveAbs(normX: Float, normY: Float, monitor: Int = 0): Boolean {
+        return send(Protocol.encodeMoveAbs(normX, normY, monitor))
+    }
+
+    fun sendScreenAck(seq: Int, fromP2p: Boolean): Boolean {
+        if (fromP2p && p2pClient.isConnected && p2pClient.sendScreenAck(seq)) {
+            return true
+        }
+        return send(Protocol.encodeScreenAck(seq))
+    }
+
+    fun resetScreenReassembler() {
+        p2pClient.resetScreenReassembler()
+    }
+
     fun queuedBytes(): Long {
         if (p2pClient.isConnected) return 0L
         return socket?.queueSize() ?: 0L
     }
 
-    fun disconnect() {
+    fun setConnectingStatus(targetLabel: String) {
+        currentTarget = targetLabel
+        _state.value = ConnectionState.Connecting(targetLabel)
+    }
+
+    fun setErrorStatus(message: String) {
+        closeActiveSocket()
+        _state.value = ConnectionState.Error(message)
+    }
+
+    fun evictConnections() {
+        runCatching { httpClient.connectionPool.evictAll() }
+    }
+
+    fun disconnectSilently() {
+        closeActiveSocket()
+    }
+
+    private fun closeActiveSocket() {
         p2pClient.stop()
         stopHeartbeat()
         releaseLowLatencyWifiLock()
         val current = socket
         socket = null
-        current?.close(1000, "User disconnected")
+        current?.close(1000, "Switching connection")
+    }
+
+    fun disconnect() {
+        closeActiveSocket()
         _state.value = ConnectionState.Disconnected
     }
 

@@ -62,6 +62,14 @@ data class UnpackedFilePacket(
     val body: ByteArray,
 )
 
+data class UnpackedScreenChunk(
+    val authTag: ByteArray,
+    val frameSeq: Int,
+    val chunkIdx: Int,
+    val totalChunks: Int,
+    val payload: ByteArray,
+)
+
 /**
  * Pure JVM wire helpers for the authenticated RemotePad Direct P2P UDP protocol
  * (fixed 28-byte control/input packets + variable-length reliable file transfer packets).
@@ -85,6 +93,10 @@ object P2PWire {
     const val PKT_FILE_DATA: Byte = 0x12
     const val PKT_FILE_ACK: Byte = 0x13
     const val PKT_FILE_ABORT: Byte = 0x14
+
+    const val PKT_SCREEN_CHUNK: Byte = 0x20
+    const val PKT_SCREEN_ACK: Byte = 0x21
+    const val SCREEN_CHUNK_HEADER_SIZE = 24
 
     const val FLAG_EOF: Byte = 0x01
 
@@ -238,6 +250,33 @@ object P2PWire {
         )
     }
 
+    fun unpackScreenChunk(data: ByteArray, length: Int = data.size): UnpackedScreenChunk? {
+        if (length < SCREEN_CHUNK_HEADER_SIZE || data.size < length) return null
+        if (data[0] != MAGIC[0] || data[1] != MAGIC[1] || data[2] != MAGIC[2] || data[3] != MAGIC[3]) {
+            return null
+        }
+        if (data[4] != PKT_SCREEN_CHUNK) return null
+        val authTag = ByteArray(8)
+        System.arraycopy(data, 8, authTag, 0, 8)
+        val buf = ByteBuffer.wrap(data, 16, 8).order(ByteOrder.BIG_ENDIAN)
+        val frameSeq = buf.int
+        val chunkIdx = buf.short.toInt() and 0xFFFF
+        val totalChunks = buf.short.toInt() and 0xFFFF
+        if (totalChunks < 1 || chunkIdx >= totalChunks) return null
+        val payloadLen = length - SCREEN_CHUNK_HEADER_SIZE
+        val payload = ByteArray(payloadLen)
+        if (payloadLen > 0) {
+            System.arraycopy(data, SCREEN_CHUNK_HEADER_SIZE, payload, 0, payloadLen)
+        }
+        return UnpackedScreenChunk(
+            authTag = authTag,
+            frameSeq = frameSeq,
+            chunkIdx = chunkIdx,
+            totalChunks = totalChunks,
+            payload = payload,
+        )
+    }
+
     fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
         if (a.size != b.size) return false
         var diff = 0
@@ -289,9 +328,21 @@ class P2PUdpClient {
     @Volatile
     private var lastRxElapsedMs: Long = 0L
 
+    @Volatile
+    var lastScreenChunkElapsedMs: Long = 0L
+        private set
+
+    fun resetScreenReassembler() {
+        screenReassembler.reset()
+    }
+
     private val txSeq = AtomicInteger(0)
     private val nextXferId = AtomicInteger(1)
     private val fileListeners = ConcurrentHashMap<Int, (UnpackedFilePacket) -> Unit>()
+    private val screenReassembler = P2PScreenReassembler()
+
+    @Volatile
+    var onScreenFrame: ((ScreenFramePacket) -> Unit)? = null
 
     @Volatile
     private var stunNonce: String = ""
@@ -332,7 +383,7 @@ class P2PUdpClient {
                     soTimeout = 250
                     runCatching { trafficClass = 0x10 } // IPTOS_LOWDELAY
                     runCatching { sendBufferSize = 262_144 }
-                    runCatching { receiveBufferSize = 262_144 }
+                    runCatching { receiveBufferSize = 1_048_576 }
                 }
             }.getOrNull()
 
@@ -514,8 +565,36 @@ class P2PUdpClient {
         }
     }
 
+    fun sendScreenAck(frameSeq: Int): Boolean {
+        val socket = udpSocket ?: return false
+        val target = peerAddress ?: return false
+        val tag = authTag
+        if (socket.isClosed || tag.size != 8) return false
+
+        val bytes = P2PWire.packControlPacket(
+            type = P2PWire.PKT_SCREEN_ACK,
+            authTag = tag,
+            seq = frameSeq,
+            timestampMs = System.currentTimeMillis(),
+        )
+        val packet = DatagramPacket(bytes, bytes.size, target)
+        val onMain = runCatching { Looper.myLooper() == Looper.getMainLooper() }.getOrDefault(false)
+        return if (onMain) {
+            scope.launch {
+                runCatching { socket.send(packet) }
+            }
+            true
+        } else {
+            runCatching {
+                socket.send(packet)
+                true
+            }.getOrDefault(false)
+        }
+    }
+
     fun stop() {
         abortAllFileListeners("P2P disconnected")
+        screenReassembler.reset()
         currentSid = ""
         authTag = ByteArray(0)
         peerAddress = null
@@ -560,7 +639,26 @@ class P2PUdpClient {
                     continue
                 }
 
-                // 2. Variable-length authenticated P2P file transfer packet
+                // 2. Variable-length authenticated P2P screen frame chunk
+                if (len >= P2PWire.SCREEN_CHUNK_HEADER_SIZE && buf[4] == P2PWire.PKT_SCREEN_CHUNK) {
+                    val chunk = P2PWire.unpackScreenChunk(buf, len) ?: continue
+                    if (!P2PWire.constantTimeEquals(chunk.authTag, tag)) continue
+                    val rxNow = SystemClock.elapsedRealtime()
+                    lastRxElapsedMs = rxNow
+                    lastScreenChunkElapsedMs = rxNow
+                    val frame = screenReassembler.onChunk(
+                        frameSeq = chunk.frameSeq,
+                        chunkIdx = chunk.chunkIdx,
+                        totalChunks = chunk.totalChunks,
+                        payload = chunk.payload,
+                    )
+                    if (frame != null) {
+                        onScreenFrame?.invoke(frame)
+                    }
+                    continue
+                }
+
+                // 3. Variable-length authenticated P2P file transfer packet
                 if (len >= P2PWire.FILE_HEADER_SIZE && P2PWire.isFilePacketType(buf[4])) {
                     val filePkt = P2PWire.unpackFilePacket(buf, len) ?: continue
                     if (!P2PWire.constantTimeEquals(filePkt.authTag, tag)) continue
@@ -639,12 +737,12 @@ class P2PUdpClient {
         keepaliveJob?.cancel()
         keepaliveJob = scope.launch {
             while (isActive && currentSid == sid && !socket.isClosed) {
-                delay(3_000)
+                delay(2_500)
                 if (currentSid != sid || socket.isClosed) break
                 val target = peerAddress ?: break
 
                 val sinceRx = SystemClock.elapsedRealtime() - lastRxElapsedMs
-                if (sinceRx > 9_500L) {
+                if (sinceRx > 12_000L) {
                     // NAT mapping dropped or network switched -> seamlessly fall back to VPS Relay
                     abortAllFileListeners("Direct P2P connection lost")
                     peerAddress = null

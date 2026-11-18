@@ -39,7 +39,7 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "autostart"; Description: "Start {#MyAppName} automatically when Windows starts"; GroupDescription: "Startup options:"
+Name: "autostart"; Description: "Start {#MyAppName} automatically at Windows boot (works before unlock / on Lock Screen)"; GroupDescription: "Startup options:"
 Name: "vbcable"; Description: "Install VB-Cable Virtual Audio Driver (required for Phone Mic)"; GroupDescription: "Audio Driver:"; Check: not IsVBCableInstalled
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
@@ -62,9 +62,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: 
 [Run]
 ; Silently install VB-Cable Virtual Audio Driver (only if not already installed)
 Filename: "{tmp}\vbcable\VBCABLE_Setup_x64.exe"; Parameters: "-i -h"; WorkingDir: "{tmp}\vbcable"; StatusMsg: "Installing VB-Cable Virtual Audio Driver (for Phone Mic)..."; Flags: runhidden waituntilterminated; Tasks: vbcable; AfterInstall: MarkVBCableInstalled
-; Register elevated Task Scheduler auto-startup (starts silently in tray with Admin/UIPI support & zero UAC prompt at boot)
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--install-autostart"; StatusMsg: "Configuring Windows auto-startup..."; Flags: runhidden waituntilterminated; Tasks: autostart
-; Launch RemotePad elevated right after installation finishes so Task Manager & Admin apps work immediately
+; Register pre-login SYSTEM boot service (RemotePadService) + user tray logon task (RemotePad)
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--install-autostart"; StatusMsg: "Configuring Windows pre-login auto-startup service..."; Flags: runhidden waituntilterminated; Tasks: autostart
+; Start the SYSTEM boot service right away so Lock Screen & Admin control work immediately
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--start-service"; StatusMsg: "Starting RemotePad background service..."; Flags: runhidden waituntilterminated; Tasks: autostart
+; Launch RemotePad Tray UI right after installation finishes (attaches seamlessly to the running service)
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
@@ -97,11 +99,16 @@ begin
   Result := VBCableFreshlyInstalled;
 end;
 
-// Gracefully close any running RemotePad.exe instance before install or uninstall
+// Gracefully stop the SYSTEM boot service and any running RemotePad.exe instance before install or uninstall
 procedure StopRunningRemotePad();
 var
   ResultCode: Integer;
+  InstalledExe: String;
 begin
+  InstalledExe := ExpandConstant('{app}\{#MyAppExeName}');
+  if FileExists(InstalledExe) then
+    Exec(InstalledExe, '--stop-service', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN RemotePadService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM RemotePad.exe /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 

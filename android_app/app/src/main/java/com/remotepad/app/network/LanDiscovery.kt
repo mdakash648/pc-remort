@@ -115,6 +115,22 @@ class LanDiscovery(context: Context) {
         }
     }
 
+    fun clearDiscovered() {
+        _discoveredPcs.value = emptyList()
+    }
+
+    /**
+     * Stops any existing discovery socket, clears stale PCs from the previous network,
+     * and starts a fresh discovery session with an immediate fast probe burst.
+     */
+    fun restart() {
+        synchronized(stateLock) {
+            stop()
+            _discoveredPcs.value = emptyList()
+            start()
+        }
+    }
+
     fun probeNow() {
         synchronized(stateLock) {
             if (scanJob?.isActive != true) {
@@ -197,14 +213,26 @@ class LanDiscovery(context: Context) {
 
     private suspend fun probeLoop(socket: DatagramSocket) {
         val probeBytes = DiscoveryProtocol.DISCOVER_PAYLOAD.toByteArray(Charsets.UTF_8)
+        var burstCount = 0
         while (scope.isActive && !socket.isClosed) {
             sendBroadcastProbe(socket, probeBytes)
-            // Wait up to PROBE_INTERVAL_MS, waking early if probeNow() is called.
+            // Send 3 fast probes during initial discovery / after network change so a single
+            // dropped UDP broadcast during Wi-Fi ARP warmup never delays LAN connection.
+            val waitTargetMs = if (burstCount < 2) {
+                burstCount += 1
+                FAST_PROBE_INTERVAL_MS
+            } else {
+                PROBE_INTERVAL_MS
+            }
             var waited = 0L
-            while (waited < PROBE_INTERVAL_MS && scope.isActive && !socket.isClosed) {
-                if (probeTrigger.tryReceive().isSuccess) break
-                delay(200)
-                waited += 200
+            while (waited < waitTargetMs && scope.isActive && !socket.isClosed) {
+                if (probeTrigger.tryReceive().isSuccess) {
+                    burstCount = 0
+                    break
+                }
+                val step = minOf(150L, waitTargetMs - waited)
+                delay(step)
+                waited += step
             }
         }
     }
@@ -281,6 +309,7 @@ class LanDiscovery(context: Context) {
 
     companion object {
         private const val SOCKET_TIMEOUT_MS = 1000
+        private const val FAST_PROBE_INTERVAL_MS = 450L
         private const val PROBE_INTERVAL_MS = 2500L
         private const val STALE_TIMEOUT_MS = 12_000L
     }

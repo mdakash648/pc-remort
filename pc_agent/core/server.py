@@ -21,10 +21,15 @@ from core.protocol import (
     KeyComboMessage,
     KeyEventMessage,
     MediaMessage,
+    MoveAbsMessage,
     MoveMessage,
     PasteMessage,
     PingMessage,
     PowerMessage,
+    ScreenAckMessage,
+    ScreenConfigMessage,
+    ScreenStartMessage,
+    ScreenStopMessage,
     ScrollMessage,
     TextMessage,
     UnknownMessage,
@@ -36,6 +41,7 @@ from core.protocol import (
     parse_message,
 )
 from features.gestures import GestureHandler
+from features.screen_capture import ScreenStreamer, WindowsScreenCapturer
 from input.keyboard import KeyboardController
 from input.media import MediaController
 from input.mouse import CursorSmoother, MouseController
@@ -107,14 +113,36 @@ def get_local_ipv4_addresses() -> list[str]:
 
 
 class _ClientSession:
-    __slots__ = ("held_buttons", "held_keys", "vol_sync_enabled", "vol_sync_task", "last_vol_state")
+    __slots__ = (
+        "held_buttons",
+        "held_keys",
+        "vol_sync_enabled",
+        "vol_sync_task",
+        "last_vol_state",
+        "screen_streamer",
+        "screen_seq",
+        "is_via_relay",
+        "p2p_send_screen",
+        "is_p2p_active",
+    )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        is_via_relay: bool = False,
+        p2p_send_screen: Any | None = None,
+        is_p2p_active: Any | None = None,
+    ) -> None:
         self.held_buttons: set[str] = set()
         self.held_keys: set[str] = set()
         self.vol_sync_enabled: bool = False
         self.vol_sync_task: asyncio.Task[None] | None = None
         self.last_vol_state: tuple[int, bool] | None = None
+        self.screen_streamer: ScreenStreamer | None = None
+        self.screen_seq: int = 0
+        self.is_via_relay: bool = is_via_relay
+        self.p2p_send_screen = p2p_send_screen
+        self.is_p2p_active = is_p2p_active
 
 
 class LocalWebSocketServer:
@@ -145,6 +173,7 @@ class LocalWebSocketServer:
         self.file_port = file_port
         self.mic_port = mic_port
         self._mic_device_provider = mic_device_provider
+        self._screen_capturer = WindowsScreenCapturer()
         self._smoother = CursorSmoother(
             mouse=self.mouse,
             enabled=config.cursor_smoothing,
@@ -213,6 +242,7 @@ class LocalWebSocketServer:
         except Exception:
             logger.exception("Unexpected error in client handler for %s", peer)
         finally:
+            await self._stop_screen_stream(session)
             await self._stop_volume_sync(session)
             self._smoother.reset()
             # Never leave mouse buttons or modifier keys stuck down on disconnect
@@ -272,6 +302,40 @@ class LocalWebSocketServer:
         session.last_vol_state = quantized
         await ws.send(encode_vol_state(level, muted))
 
+    async def _start_screen_stream(
+        self,
+        ws: ServerConnection,
+        session: _ClientSession,
+        msg: ScreenStartMessage,
+    ) -> None:
+        if session.screen_streamer is None:
+            async def send_binary(frame_bytes: bytes) -> None:
+                await ws.send(frame_bytes)
+
+            session.screen_streamer = ScreenStreamer(
+                send_ws_binary=send_binary,
+                capturer=self._screen_capturer,
+                send_p2p_frame=session.p2p_send_screen,
+                is_p2p_active=session.is_p2p_active,
+                is_via_relay=session.is_via_relay,
+                initial_seq=session.screen_seq,
+            )
+        await session.screen_streamer.start(
+            quality=msg.quality,
+            fps=msg.fps,
+            max_width=msg.max_width,
+            monitor=msg.monitor,
+            prefer_p2p=msg.prefer_p2p,
+            hide_cursor=msg.hide_cursor,
+        )
+
+    async def _stop_screen_stream(self, session: _ClientSession) -> None:
+        streamer = session.screen_streamer
+        session.screen_streamer = None
+        if streamer is not None:
+            session.screen_seq = streamer.last_seq
+            await streamer.stop()
+
     async def _dispatch(
         self,
         ws: ServerConnection,
@@ -281,6 +345,18 @@ class LocalWebSocketServer:
     ) -> None:
         if isinstance(msg, MoveMessage):
             self._smoother.enqueue(msg.dx, msg.dy)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
+        elif isinstance(msg, MoveAbsMessage):
+            self._smoother.flush()
+            mon_rect = (
+                session.screen_streamer.get_monitor_rect(msg.monitor)
+                if session.screen_streamer is not None
+                else self._screen_capturer.get_monitor_rect(msg.monitor)
+            )
+            self.mouse.move_absolute(msg.x, msg.y, monitor_rect=mon_rect)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, ButtonMessage):
             self._smoother.flush()
             self.mouse.button(msg.button, msg.state)
@@ -288,24 +364,38 @@ class LocalWebSocketServer:
                 session.held_buttons.add(msg.button)
             else:
                 session.held_buttons.discard(msg.button)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, ClickMessage):
             self._smoother.flush()
             self.mouse.click(msg.button, msg.count)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, ScrollMessage):
             self._smoother.flush()
             self.mouse.scroll(msg.dx, msg.dy)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, KeyComboMessage):
             self.keyboard.key_combo(msg.keys)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, KeyEventMessage):
             if self.keyboard.key_event(msg.key, msg.state):
                 if msg.state == "down":
                     session.held_keys.add(msg.key)
                 else:
                     session.held_keys.discard(msg.key)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, TextMessage):
             self.keyboard.type_text(msg.value)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, PasteMessage):
             self.keyboard.paste_text(msg.value)
+            if session.screen_streamer is not None:
+                session.screen_streamer.notify_input_activity()
         elif isinstance(msg, GestureMessage):
             self.gestures.handle(msg.gesture)
         elif isinstance(msg, VolumeSyncMessage):
@@ -340,6 +430,23 @@ class LocalWebSocketServer:
                 self.media.handle(msg.action)
         elif isinstance(msg, PowerMessage):
             self.power.handle(msg.action)
+        elif isinstance(msg, ScreenStartMessage):
+            await self._start_screen_stream(ws, session, msg)
+        elif isinstance(msg, ScreenStopMessage):
+            await self._stop_screen_stream(session)
+        elif isinstance(msg, ScreenConfigMessage):
+            if session.screen_streamer is not None:
+                session.screen_streamer.update_config(
+                    quality=msg.quality,
+                    fps=msg.fps,
+                    max_width=msg.max_width,
+                    monitor=msg.monitor,
+                    prefer_p2p=msg.prefer_p2p,
+                    hide_cursor=msg.hide_cursor,
+                )
+        elif isinstance(msg, ScreenAckMessage):
+            if session.screen_streamer is not None:
+                session.screen_streamer.on_ack(msg.seq)
         elif isinstance(msg, PingMessage):
             self._smoother.flush()
             await ws.send(encode_pong())
