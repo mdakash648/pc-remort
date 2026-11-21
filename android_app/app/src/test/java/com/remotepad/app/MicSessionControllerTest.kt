@@ -114,8 +114,9 @@ class MicSessionControllerTest {
 
         val relay = FakeMicAdapter(state = vpsConnected())
         val c3 = MicSessionController(relay)
-        assertFalse(c3.setMicEnabled(true))
-        assertEquals("PC Mic works on Local Wi-Fi only", c3.micError.value)
+        assertTrue(c3.setMicEnabled(true))
+        assertTrue(c3.isMicEnabled.value)
+        assertNull(c3.micError.value)
     }
 
     @Test
@@ -150,7 +151,7 @@ class MicSessionControllerTest {
     }
 
     @Test
-    fun stopsMicCleanlyWhenSwitchedToVpsOrReconnectExhausted() {
+    fun micPersistsAcrossVpsSwitchAndStopsCleanlyWhenReconnectExhausted() {
         val adapter = FakeMicAdapter()
         val controller = MicSessionController(adapter)
 
@@ -158,29 +159,25 @@ class MicSessionControllerTest {
         controller.onForegroundServiceMicReady()
         assertTrue(controller.isMicStreaming.value)
 
-        // Switches to VPS relay -> mic stops and releases FGS + locks
+        // Switches to VPS relay -> mic stays enabled and streams via relay tunnel
         adapter.state = vpsConnected()
+        controller.onConnectionStateChanged(adapter.state)
+        assertTrue("Mic remains enabled when switching to VPS", controller.isMicEnabled.value)
+        assertTrue("Mic continues streaming over relay tunnel", controller.isMicStreaming.value)
+        assertTrue(controller.shouldHoldMicrophoneForeground)
+        assertTrue(adapter.locksHeld)
+        assertEquals(0, adapter.fgReleases)
+        assertNull(controller.micError.value)
+
+        // Reconnect exhausted -> cleanly stops mic and releases FGS + locks
+        adapter.autoRecovering = false
+        adapter.state = ConnectionState.Error("Reconnect stopped (5/5 attempts)")
         controller.onConnectionStateChanged(adapter.state)
         assertFalse(controller.isMicEnabled.value)
         assertFalse(controller.isMicStreaming.value)
         assertFalse(controller.shouldHoldMicrophoneForeground)
         assertFalse(adapter.locksHeld)
         assertEquals(1, adapter.fgReleases)
-        assertNotNull(controller.micError.value)
-
-        // Re-enable on LAN, then simulate exhausted reconnect
-        adapter.state = lanConnected()
-        controller.setMicEnabled(true)
-        controller.onForegroundServiceMicReady()
-        assertTrue(controller.isMicStreaming.value)
-
-        adapter.autoRecovering = false
-        adapter.state = ConnectionState.Error("Reconnect stopped (5/5 attempts)")
-        controller.onConnectionStateChanged(adapter.state)
-        assertFalse(controller.isMicEnabled.value)
-        assertFalse(controller.shouldHoldMicrophoneForeground)
-        assertFalse(adapter.locksHeld)
-        assertEquals(2, adapter.fgReleases)
     }
 
     @Test

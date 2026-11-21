@@ -87,12 +87,6 @@ class MicSessionController(
                 return@synchronized false
             }
 
-            if (connected.viaRelay || connected.host.isBlank()) {
-                _micError.value = "PC Mic works on Local Wi-Fi only"
-                stopMicStateLocked(errorMessage = _micError.value)
-                return@synchronized false
-            }
-
             generation += 1
             micDesiredByUser = true
             _isMicEnabled.value = true
@@ -133,12 +127,7 @@ class MicSessionController(
             val state = adapter.currentConnectionState()
             when (state) {
                 is ConnectionState.Connected -> {
-                    if (state.viaRelay || state.host.isBlank()) {
-                        stopMicStateLocked(errorMessage = "PC Mic works on Local Wi-Fi only")
-                        shouldReleaseFg = true
-                    } else {
-                        shouldReleaseFg = !startStreamForConnectedLocked(state, gen)
-                    }
+                    shouldReleaseFg = !startStreamForConnectedLocked(state, gen)
                 }
                 is ConnectionState.Connecting -> {
                     // Keep mic enabled + FGS active while LAN reconnect finishes
@@ -179,10 +168,7 @@ class MicSessionController(
             val gen = generation
             when (state) {
                 is ConnectionState.Connected -> {
-                    if (state.viaRelay || state.host.isBlank()) {
-                        stopMicStateLocked(errorMessage = "PC Mic stopped — Local Wi-Fi only")
-                        shouldReleaseFg = true
-                    } else if (foregroundMicReady) {
+                    if (foregroundMicReady) {
                         shouldReleaseFg = !startStreamForConnectedLocked(state, gen)
                     }
                 }

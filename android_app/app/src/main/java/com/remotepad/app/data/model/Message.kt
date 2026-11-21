@@ -188,6 +188,14 @@ data class P2POfferMessage(
     val endpoints: List<P2PEndpoint>,
 )
 
+@Serializable
+data class ConnectedDeviceInfo(
+    val id: String = "",
+    val name: String = "",
+    val transport: String = "",
+    val ip: String = "",
+)
+
 sealed interface IncomingMessage {
     data class HelloAck(
         val version: Int,
@@ -196,6 +204,11 @@ sealed interface IncomingMessage {
         val filePort: Int = 8767,
         val micPort: Int = 8768,
         val micDevice: String = "",
+        val connectedCount: Int = 1,
+    ) : IncomingMessage
+    data class DevicesUpdate(
+        val count: Int,
+        val devices: List<ConnectedDeviceInfo> = emptyList(),
     ) : IncomingMessage
     data class RelayReady(
         val pcName: String,

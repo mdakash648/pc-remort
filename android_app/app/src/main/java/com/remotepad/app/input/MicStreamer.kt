@@ -37,11 +37,18 @@ class MicStreamer(
     private var workerThread: Thread? = null
     private val lock = Any()
 
+    @Volatile
+    var sendWebSocketBinary: ((ByteArray) -> Boolean)? = null
+
     val isStreaming: Boolean
         get() = running
 
     fun isStreamingTo(host: String, port: Int): Boolean {
         val cleanHost = host.trim()
+        val wsSender = sendWebSocketBinary
+        if (wsSender != null && cleanHost.isEmpty()) {
+            return running
+        }
         return running && activeHost == cleanHost && activePort == port
     }
 
@@ -49,7 +56,8 @@ class MicStreamer(
     fun start(host: String, port: Int): Boolean {
         synchronized(lock) {
             val cleanHost = host.trim()
-            if (cleanHost.isEmpty() || port !in 1..65535) {
+            val useWs = sendWebSocketBinary != null && (cleanHost.isEmpty() || port !in 1..65535)
+            if (!useWs && (cleanHost.isEmpty() || port !in 1..65535)) {
                 stopLocked()
                 onError("Invalid PC address for microphone")
                 return false
@@ -83,7 +91,7 @@ class MicStreamer(
             activeRecorder = recorder
             workerThread = thread(name = "remotepad-mic-streamer", isDaemon = true) {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-                streamLoop(recorder, bufferSize, cleanHost, port)
+                streamLoop(recorder, bufferSize, cleanHost, port, useWs)
             }
             return true
         }
@@ -162,20 +170,25 @@ class MicStreamer(
         runCatching { recorder?.release() }
     }
 
-    private fun streamLoop(initialRecorder: AudioRecord, bufferSize: Int, host: String, port: Int) {
+    private fun streamLoop(initialRecorder: AudioRecord, bufferSize: Int, host: String, port: Int, useWs: Boolean = false) {
         var recorder: AudioRecord? = initialRecorder
         var noiseSuppressor: NoiseSuppressor? = null
         var echoCanceler: AcousticEchoCanceler? = null
         var socket: DatagramSocket? = null
+        var address: InetAddress? = null
 
         try {
             val (ns, aec) = attachAudioEffects(initialRecorder)
             noiseSuppressor = ns
             echoCanceler = aec
 
-            val address = InetAddress.getByName(host)
-            socket = DatagramSocket().apply {
-                runCatching { trafficClass = 0x10 } // IPTOS_LOWDELAY
+            if (!useWs && host.isNotBlank()) {
+                address = runCatching { InetAddress.getByName(host) }.getOrNull()
+                socket = runCatching {
+                    DatagramSocket().apply {
+                        trafficClass = 0x10 // IPTOS_LOWDELAY
+                    }
+                }.getOrNull()
             }
 
             val packetBuf = ByteArray(HEADER_BYTES + FRAME_BYTES)
@@ -231,8 +244,13 @@ class MicStreamer(
                 recoveryAttempts = 0
 
                 val totalBytes = packMicPacket(packetBuf, seq++, pcmShortBuf, readSamples)
-                val dgram = DatagramPacket(packetBuf, totalBytes, address, port)
-                runCatching { socket.send(dgram) }
+                val wsSender = sendWebSocketBinary
+                if (useWs || (wsSender != null && (socket == null || address == null))) {
+                    wsSender?.invoke(packetBuf.copyOf(totalBytes))
+                } else if (socket != null && address != null) {
+                    val dgram = DatagramPacket(packetBuf, totalBytes, address, port)
+                    runCatching { socket.send(dgram) }
+                }
 
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastLevelMs >= 65L) {

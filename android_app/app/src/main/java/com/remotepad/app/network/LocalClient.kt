@@ -49,6 +49,7 @@ sealed interface ConnectionState {
         val viaRelay: Boolean = false,
         val transportMode: TransportMode = if (viaRelay) TransportMode.VPS_RELAY else TransportMode.LAN,
         val p2pRttMs: Int? = null,
+        val connectedDevicesCount: Int = 1,
     ) : ConnectionState
     data class Error(val message: String) : ConnectionState
 }
@@ -118,6 +119,9 @@ class LocalClient(context: Context? = null) {
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val state: StateFlow<ConnectionState> = _state.asStateFlow()
 
+    private val _connectedDevicesCount = MutableStateFlow(1)
+    val connectedDevicesCount: StateFlow<Int> = _connectedDevicesCount.asStateFlow()
+
     private val _volumeState = MutableStateFlow(RemoteVolumeState())
     val volumeState: StateFlow<RemoteVolumeState> = _volumeState.asStateFlow()
 
@@ -136,6 +140,9 @@ class LocalClient(context: Context? = null) {
     private var wifiLock: WifiManager.WifiLock? = null
 
     init {
+        p2pClient.sendWebSocketBinary = { bytes ->
+            sendBinary(bytes)
+        }
         p2pClient.onScreenFrame = { frame ->
             _screenFrames.tryEmit(frame)
         }
@@ -202,6 +209,7 @@ class LocalClient(context: Context? = null) {
                 when (val msg = Protocol.decodeIncoming(text)) {
                     is IncomingMessage.HelloAck -> {
                         if (msg.ok) {
+                            _connectedDevicesCount.value = msg.connectedCount
                             _state.value = ConnectionState.Connected(
                                 pcName = msg.pcName,
                                 target = currentTarget,
@@ -209,10 +217,18 @@ class LocalClient(context: Context? = null) {
                                 filePort = msg.filePort,
                                 micPort = msg.micPort,
                                 micDevice = msg.micDevice,
+                                connectedDevicesCount = msg.connectedCount,
                             )
                         } else {
                             _state.value = ConnectionState.Error("Rejected by PC")
                             webSocket.close(1008, "Rejected")
+                        }
+                    }
+                    is IncomingMessage.DevicesUpdate -> {
+                        _connectedDevicesCount.value = msg.count
+                        val cur = _state.value
+                        if (cur is ConnectionState.Connected) {
+                            _state.value = cur.copy(connectedDevicesCount = msg.count)
                         }
                     }
                     is IncomingMessage.VolumeState -> {
@@ -236,6 +252,10 @@ class LocalClient(context: Context? = null) {
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (socket !== webSocket) return
                 val raw = bytes.toByteArray()
+                if (raw.size >= 4 && raw[0] == 'R'.code.toByte() && raw[1] == 'P'.code.toByte() && raw[2] == '2'.code.toByte() && raw[3] == 'P'.code.toByte()) {
+                    p2pClient.onRawFilePacketReceived(raw)
+                    return
+                }
                 val frame = ScreenFrameWire.decode(raw, raw.size, fromP2p = false) ?: return
                 _screenFrames.tryEmit(frame)
             }
@@ -346,15 +366,27 @@ class LocalClient(context: Context? = null) {
                     }
                     is IncomingMessage.HelloAck -> {
                         if (msg.ok) {
+                            _connectedDevicesCount.value = msg.connectedCount
                             val existing = _state.value as? ConnectionState.Connected
                             _state.value = ConnectionState.Connected(
                                 pcName = msg.pcName,
                                 target = currentTarget,
                                 host = "",
+                                filePort = msg.filePort,
+                                micPort = msg.micPort,
+                                micDevice = msg.micDevice,
                                 viaRelay = true,
                                 transportMode = existing?.transportMode ?: TransportMode.P2P_CONNECTING,
                                 p2pRttMs = existing?.p2pRttMs,
+                                connectedDevicesCount = msg.connectedCount,
                             )
+                        }
+                    }
+                    is IncomingMessage.DevicesUpdate -> {
+                        _connectedDevicesCount.value = msg.count
+                        val cur = _state.value
+                        if (cur is ConnectionState.Connected) {
+                            _state.value = cur.copy(connectedDevicesCount = msg.count)
                         }
                     }
                     is IncomingMessage.VolumeState -> {
@@ -371,6 +403,10 @@ class LocalClient(context: Context? = null) {
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (socket !== webSocket) return
                 val raw = bytes.toByteArray()
+                if (raw.size >= 4 && raw[0] == 'R'.code.toByte() && raw[1] == 'P'.code.toByte() && raw[2] == '2'.code.toByte() && raw[3] == 'P'.code.toByte()) {
+                    p2pClient.onRawFilePacketReceived(raw)
+                    return
+                }
                 val frame = ScreenFrameWire.decode(raw, raw.size, fromP2p = false) ?: return
                 _screenFrames.tryEmit(frame)
             }
@@ -405,6 +441,10 @@ class LocalClient(context: Context? = null) {
 
     fun send(payload: String): Boolean {
         return socket?.send(payload) ?: false
+    }
+
+    fun sendBinary(bytes: ByteArray): Boolean {
+        return socket?.send(ByteString.of(*bytes)) ?: false
     }
 
     /**

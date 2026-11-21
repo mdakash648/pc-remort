@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -77,6 +78,44 @@ def resolve_unique_path(directory: Path, filename: str) -> Path:
         if not alt.exists():
             return alt
         counter += 1
+
+
+_EXTRA_MIMES = {
+    ".mkv": "video/x-matroska",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime",
+    ".flv": "video/x-flv",
+    ".ts": "video/mp2t",
+    ".3gp": "video/3gpp",
+    ".webp": "image/webp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain; charset=utf-8",
+    ".json": "application/json",
+}
+
+
+def _guess_mime_type(target: Path) -> str:
+    ext = target.suffix.lower()
+    if ext in _EXTRA_MIMES:
+        return _EXTRA_MIMES[ext]
+    guessed, _ = mimetypes.guess_type(target.name)
+    return guessed or "application/octet-stream"
 
 
 def _first_existing_dir(*paths: Path) -> Path | None:
@@ -236,9 +275,9 @@ class FileTransferServer:
             elif method == "GET" and path == "/api/list":
                 dir_param = query.get("path", [""])[0]
                 await self._handle_list(writer, dir_param)
-            elif method == "GET" and path == "/api/download":
+            elif method in ("GET", "HEAD") and path == "/api/download":
                 file_param = query.get("path", [""])[0]
-                await self._handle_download(writer, file_param)
+                await self._handle_download(writer, file_param, headers, is_head=(method == "HEAD"))
             elif method == "POST" and path == "/api/upload":
                 name_param = query.get("name", [""])[0]
                 dir_param = query.get("dir", [""])[0]
@@ -315,7 +354,13 @@ class FileTransferServer:
         status, payload = self.build_list_payload(raw_dir)
         await _send_json(writer, status, payload)
 
-    async def _handle_download(self, writer: asyncio.StreamWriter, raw_path: str) -> None:
+    async def _handle_download(
+        self,
+        writer: asyncio.StreamWriter,
+        raw_path: str,
+        headers: dict[str, str],
+        is_head: bool = False,
+    ) -> None:
         if not raw_path.strip():
             await _send_json(writer, 400, {"ok": False, "error": "Missing path"})
             return
@@ -332,27 +377,99 @@ class FileTransferServer:
             await _send_json(writer, 403, {"ok": False, "error": str(exc)})
             return
 
+        # Accurate MIME type for instant in-app viewing & streaming
+        mime_type = _guess_mime_type(target)
         safe_header_name = target.name.replace('"', "'").encode("ascii", errors="replace").decode("ascii")
-        header = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            f"Content-Length: {file_size}\r\n"
-            f'Content-Disposition: attachment; filename="{safe_header_name}"\r\n'
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode("iso-8859-1")
+
+        # Check HTTP Range header (e.g. bytes=0-1048575, bytes=1048576-, bytes=-5000)
+        range_header = headers.get("range", "").strip()
+        is_range = False
+        start_byte = 0
+        end_byte = file_size - 1
+
+        if range_header.startswith("bytes="):
+            spec = range_header[6:].split(",", 1)[0].strip()
+            parts = spec.split("-", 1)
+            try:
+                if not parts[0] and parts[1]:
+                    # Suffix range: -500 (last 500 bytes)
+                    suffix_len = int(parts[1])
+                    start_byte = max(0, file_size - suffix_len)
+                    end_byte = file_size - 1
+                    is_range = True
+                elif parts[0] and not parts[1]:
+                    # From offset to end: 1000-
+                    start_byte = int(parts[0])
+                    end_byte = file_size - 1
+                    is_range = True
+                elif parts[0] and parts[1]:
+                    # Specific range: 1000-2000
+                    start_byte = int(parts[0])
+                    end_byte = min(int(parts[1]), file_size - 1)
+                    is_range = True
+            except ValueError:
+                is_range = False
+
+            if is_range and (start_byte >= file_size or start_byte > end_byte):
+                # 416 Range Not Satisfiable
+                file_obj.close()
+                err_resp = (
+                    "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                    f"Content-Range: bytes */{file_size}\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("iso-8859-1")
+                writer.write(err_resp)
+                await writer.drain()
+                return
+
+        if is_range:
+            content_len = max(0, end_byte - start_byte + 1)
+            header = (
+                "HTTP/1.1 206 Partial Content\r\n"
+                f"Content-Type: {mime_type}\r\n"
+                f"Content-Length: {content_len}\r\n"
+                f"Content-Range: bytes {start_byte}-{end_byte}/{file_size}\r\n"
+                "Accept-Ranges: bytes\r\n"
+                f'Content-Disposition: inline; filename="{safe_header_name}"\r\n'
+                "Connection: close\r\n\r\n"
+            ).encode("iso-8859-1")
+        else:
+            header = (
+                "HTTP/1.1 200 OK\r\n"
+                f"Content-Type: {mime_type}\r\n"
+                f"Content-Length: {file_size}\r\n"
+                "Accept-Ranges: bytes\r\n"
+                f'Content-Disposition: inline; filename="{safe_header_name}"\r\n'
+                "Connection: close\r\n\r\n"
+            ).encode("iso-8859-1")
 
         try:
             writer.write(header)
             await writer.drain()
 
+            if is_head:
+                return
+
             loop = asyncio.get_running_loop()
-            while True:
-                chunk = await loop.run_in_executor(None, file_obj.read, CHUNK_SIZE)
-                if not chunk:
-                    break
-                writer.write(chunk)
-                await writer.drain()
+            if is_range:
+                await loop.run_in_executor(None, file_obj.seek, start_byte)
+                bytes_left = content_len
+                while bytes_left > 0:
+                    read_size = min(CHUNK_SIZE, bytes_left)
+                    chunk = await loop.run_in_executor(None, file_obj.read, read_size)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    await writer.drain()
+                    bytes_left -= len(chunk)
+            else:
+                while True:
+                    chunk = await loop.run_in_executor(None, file_obj.read, CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    await writer.drain()
         finally:
             file_obj.close()
 

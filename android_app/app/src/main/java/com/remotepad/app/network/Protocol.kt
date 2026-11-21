@@ -3,6 +3,7 @@ package com.remotepad.app.network
 import com.remotepad.app.data.model.ButtonMessage
 import com.remotepad.app.data.model.ButtonState
 import com.remotepad.app.data.model.ClickMessage
+import com.remotepad.app.data.model.ConnectedDeviceInfo
 import com.remotepad.app.data.model.GestureMessage
 import com.remotepad.app.data.model.HelloMessage
 import com.remotepad.app.data.model.IncomingMessage
@@ -170,6 +171,7 @@ object Protocol {
                     val filePort = obj["file_port"]?.jsonPrimitive?.intOrNull ?: 8767
                     val micPort = obj["mic_port"]?.jsonPrimitive?.intOrNull ?: 8768
                     val micDevice = obj["mic_device"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val connectedCount = obj["connected_count"]?.jsonPrimitive?.intOrNull ?: 1
                     IncomingMessage.HelloAck(
                         version = version,
                         ok = ok,
@@ -177,7 +179,23 @@ object Protocol {
                         filePort = filePort,
                         micPort = micPort,
                         micDevice = micDevice,
+                        connectedCount = connectedCount,
                     )
+                }
+                "devices_update" -> {
+                    val count = obj["count"]?.jsonPrimitive?.intOrNull ?: 1
+                    val devices = obj["devices"]?.jsonArray?.mapNotNull { elem ->
+                        runCatching {
+                            val dObj = elem.jsonObject
+                            ConnectedDeviceInfo(
+                                id = dObj["id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                                name = dObj["name"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                                transport = dObj["transport"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                                ip = dObj["ip"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                            )
+                        }.getOrNull()
+                    }.orEmpty()
+                    IncomingMessage.DevicesUpdate(count = count, devices = devices)
                 }
                 "relay_ready" -> {
                     val name = obj["name"]?.jsonPrimitive?.contentOrNull ?: "Windows PC"

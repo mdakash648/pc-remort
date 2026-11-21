@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -114,8 +115,8 @@ class AgentConfig:
     relay_url: str = "ws://182.255.88.108:8770"
     relay_udp_port: int = 8771
     relay_p2p_enabled: bool = True
-    relay_device_id: str = "akash-pc"
-    relay_token: str = "rpad-7f4c9a2e8b1d6305"
+    relay_device_id: str = ""
+    relay_token: str = ""
     mouse_sensitivity: float = 1.0
     mouse_acceleration: float = 0.35
     cursor_smoothing: bool = True
@@ -132,6 +133,53 @@ class AgentConfig:
             "desktop_right": ["win", "ctrl", "right"],
         }
     )
+    blocked_devices: list[dict[str, str]] = field(default_factory=list)
+
+    def is_device_blocked(self, name: str = "", ip: str = "", dev_id: str = "") -> bool:
+        clean_name = name.strip().lower()
+        clean_ip = ip.strip()
+        clean_id = dev_id.strip().lower()
+        for b in self.blocked_devices:
+            b_name = b.get("name", "").strip().lower()
+            b_ip = b.get("ip", "").strip()
+            b_id = b.get("id", "").strip().lower()
+            if clean_name and b_name and clean_name == b_name:
+                return True
+            if clean_ip and b_ip and clean_ip == b_ip:
+                return True
+            if clean_id and b_id and clean_id == b_id:
+                return True
+        return False
+
+    def block_device(self, name: str = "", ip: str = "", dev_id: str = "") -> None:
+        if not self.is_device_blocked(name=name, ip=ip, dev_id=dev_id):
+            self.blocked_devices.append({
+                "name": name.strip(),
+                "ip": ip.strip(),
+                "id": dev_id.strip(),
+                "blocked_at": str(int(time.time())),
+            })
+            try:
+                self.save()
+            except Exception as exc:
+                logger.warning("Could not persist blocked device: %s", exc)
+
+    def unblock_device(self, identifier: str) -> bool:
+        clean = identifier.strip().lower()
+        initial_len = len(self.blocked_devices)
+        self.blocked_devices = [
+            b for b in self.blocked_devices
+            if b.get("name", "").strip().lower() != clean
+            and b.get("ip", "").strip() != identifier.strip()
+            and b.get("id", "").strip().lower() != clean
+        ]
+        if len(self.blocked_devices) != initial_len:
+            try:
+                self.save()
+            except Exception as exc:
+                logger.warning("Could not persist unblocked device: %s", exc)
+            return True
+        return False
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AgentConfig":
@@ -144,6 +192,10 @@ class AgentConfig:
                 return cls()
             valid_fields = {f for f in cls.__dataclass_fields__}
             filtered = {k: v for k, v in raw.items() if k in valid_fields}
+            if filtered.get("relay_device_id") == "akash-pc":
+                filtered["relay_device_id"] = ""
+            if filtered.get("relay_token") in ("rpad-7f4c9a2e8b1d6305", "@k@$h@ndn@zmuL55"):
+                filtered["relay_token"] = ""
             return cls(**filtered)
         except Exception as exc:
             logger.warning("Failed to load config from %s: %s", config_path, exc)

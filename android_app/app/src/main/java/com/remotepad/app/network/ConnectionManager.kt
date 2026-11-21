@@ -158,12 +158,11 @@ class WifiFirstConnector(
                 adapter.stopDiscovery()
                 return ConnectOutcome.CONNECTED_WIFI
             }
-        } else if (net.isWifiOrEthernet) {
-            // Router may block UDP broadcast; try saved LAN IP directly ONLY if it is on
-            // the current Wi-Fi/Ethernet local subnet (avoids wasting time on foreign Wi-Fi).
+        } else if (net.isWifiOrEthernet || net.isVpn) {
+            // Router or VPN may block UDP broadcast; try saved LAN IP directly
             val savedHost = adapter.savedLanHost().trim()
             val savedPort = adapter.savedLanPort()
-            if (savedHost.isNotEmpty() && savedPort in 1..65535 && net.matchesLocalSubnet(savedHost)) {
+            if (savedHost.isNotEmpty() && savedPort in 1..65535 && (net.isVpn || net.matchesLocalSubnet(savedHost))) {
                 if (adapter.tryConnectLan(savedHost, savedPort, savedIpConnectTimeoutMs)) {
                     adapter.stopDiscovery()
                     return ConnectOutcome.CONNECTED_WIFI
@@ -269,12 +268,16 @@ class ConnectionManager private constructor(context: Context) {
     val relayUrl: StateFlow<String> = _relayUrl.asStateFlow()
 
     private val _relayDeviceId = MutableStateFlow(
-        prefs.getString(KEY_RELAY_DEVICE_ID, DEFAULT_RELAY_DEVICE_ID) ?: DEFAULT_RELAY_DEVICE_ID
+        prefs.getString(KEY_RELAY_DEVICE_ID, DEFAULT_RELAY_DEVICE_ID)?.let {
+            if (it == "akash-pc") "" else it
+        } ?: DEFAULT_RELAY_DEVICE_ID
     )
     val relayDeviceId: StateFlow<String> = _relayDeviceId.asStateFlow()
 
     private val _relayToken = MutableStateFlow(
-        prefs.getString(KEY_RELAY_TOKEN, DEFAULT_RELAY_TOKEN) ?: DEFAULT_RELAY_TOKEN
+        prefs.getString(KEY_RELAY_TOKEN, DEFAULT_RELAY_TOKEN)?.let {
+            if (it == "rpad-7f4c9a2e8b1d6305") "" else it
+        } ?: DEFAULT_RELAY_TOKEN
     )
     val relayToken: StateFlow<String> = _relayToken.asStateFlow()
 
@@ -422,6 +425,16 @@ class ConnectionManager private constructor(context: Context) {
     )
 
     init {
+        // Clear any old hardcoded default PC ID and Token if present in preferences
+        val storedDevId = prefs.getString(KEY_RELAY_DEVICE_ID, null)
+        val storedToken = prefs.getString(KEY_RELAY_TOKEN, null)
+        if (storedDevId == "akash-pc" || storedToken == "rpad-7f4c9a2e8b1d6305") {
+            val editor = prefs.edit()
+            if (storedDevId == "akash-pc") editor.putString(KEY_RELAY_DEVICE_ID, "")
+            if (storedToken == "rpad-7f4c9a2e8b1d6305") editor.putString(KEY_RELAY_TOKEN, "")
+            editor.apply()
+        }
+
         micSession = MicSessionController(
             adapter = object : MicSessionAdapter {
                 override fun hasRecordAudioPermission(): Boolean {
@@ -471,6 +484,9 @@ class ConnectionManager private constructor(context: Context) {
                 }
             }
         )
+        micStreamer.sendWebSocketBinary = { bytes ->
+            client.sendBinary(bytes)
+        }
         networkMonitor.start()
         observeConnectionLifecycle()
     }
@@ -959,8 +975,8 @@ class ConnectionManager private constructor(context: Context) {
         private const val KEY_AUTO_CONNECT = "auto_connect"
         private const val DEFAULT_PORT = "8765"
         private const val DEFAULT_RELAY_URL = "ws://182.255.88.108:8770"
-        private const val DEFAULT_RELAY_DEVICE_ID = "akash-pc"
-        private const val DEFAULT_RELAY_TOKEN = "rpad-7f4c9a2e8b1d6305"
+        private const val DEFAULT_RELAY_DEVICE_ID = ""
+        private const val DEFAULT_RELAY_TOKEN = ""
         private const val NETWORK_SWITCH_DEBOUNCE_MS = 650L
 
         internal fun retryBackoffMs(attempt: Int): Long = when (attempt) {

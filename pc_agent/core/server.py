@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import json
 import logging
 import socket
 import sys
+import time
 from typing import Any
 
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
 
 from config import AgentConfig
+from core.device_manager import ConnectedDevice, DeviceManager
+from core.p2p_file import P2PFileHandler, unpack_file_header
 from core.protocol import (
     ButtonMessage,
     ClickMessage,
@@ -41,6 +45,7 @@ from core.protocol import (
     parse_message,
 )
 from features.gestures import GestureHandler
+from features.mic_receiver import MicReceiverService
 from features.screen_capture import ScreenStreamer, WindowsScreenCapturer
 from input.keyboard import KeyboardController
 from input.media import MediaController
@@ -162,6 +167,9 @@ class LocalWebSocketServer:
         file_port: int | None = None,
         mic_port: int | None = None,
         mic_device_provider: Any | None = None,
+        device_manager: DeviceManager | None = None,
+        file_handler: P2PFileHandler | None = None,
+        mic_server: MicReceiverService | None = None,
     ) -> None:
         self.config = config
         self.mouse = mouse
@@ -173,6 +181,9 @@ class LocalWebSocketServer:
         self.file_port = file_port
         self.mic_port = mic_port
         self._mic_device_provider = mic_device_provider
+        self._device_manager = device_manager
+        self._file_handler = file_handler
+        self._mic_server = mic_server
         self._screen_capturer = WindowsScreenCapturer()
         self._smoother = CursorSmoother(
             mouse=self.mouse,
@@ -188,6 +199,21 @@ class LocalWebSocketServer:
         if self._server and self._server.sockets:
             return int(self._server.sockets[0].getsockname()[1])
         return self.config.port
+
+    async def broadcast_json_async(self, payload: dict[str, Any]) -> None:
+        """Broadcast a JSON payload to all connected local WebSocket clients."""
+        text = json.dumps(payload, separators=(",", ":"))
+        coros = [ws.send(text) for ws in list(self._clients)]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+
+    def broadcast_json(self, payload: dict[str, Any]) -> None:
+        """Schedule an async broadcast of JSON payload to all local clients."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.broadcast_json_async(payload))
+        except RuntimeError:
+            pass
 
     async def start(self) -> None:
         self._smoother.start()
@@ -218,23 +244,76 @@ class LocalWebSocketServer:
     async def _handle_client(self, ws: ServerConnection) -> None:
         _configure_low_latency_socket(ws)
         peer = _format_peer(ws.remote_address)
+        peer_ip = ws.remote_address[0] if isinstance(ws.remote_address, tuple) and ws.remote_address else ""
+        dev_id = f"lan:{peer}"
+
+        if self._device_manager and self._device_manager.is_blocked(ip=peer_ip, dev_id=dev_id):
+            logger.warning("Rejecting connection from blocked IP %s (%s)", peer_ip, dev_id)
+            await ws.close(4003, "Blocked by host")
+            return
+
         self._clients.add(ws)
         session = _ClientSession()
         logger.info("Client connected: %s (active=%d)", peer, len(self._clients))
+        device_registered = False
 
         try:
             async for raw_message in ws:
                 if isinstance(raw_message, bytes):
-                    try:
-                        raw_message = raw_message.decode("utf-8")
-                    except UnicodeDecodeError:
-                        logger.warning("Ignoring invalid UTF-8 frame from %s", peer)
+                    if raw_message.startswith(b"RP2P"):
+                        if self._file_handler is not None:
+                            header = unpack_file_header(raw_message)
+                            if header is not None:
+                                pkt_type, flags, auth_tag, xfer_id, body = header
+                                self._file_handler.handle_packet(
+                                    pkt_type,
+                                    flags,
+                                    auth_tag,
+                                    xfer_id,
+                                    body,
+                                    lambda pkt: asyncio.create_task(ws.send(pkt)),
+                                )
                         continue
+                    elif raw_message.startswith(b"RMIC"):
+                        if self._mic_server is not None:
+                            self._mic_server.feed_packet(raw_message)
+                        continue
+                    else:
+                        try:
+                            raw_message = raw_message.decode("utf-8")
+                        except UnicodeDecodeError:
+                            logger.warning("Ignoring invalid UTF-8 frame from %s", peer)
+                            continue
 
                 msg = parse_message(raw_message)
                 if msg is None:
                     logger.warning("Ignoring malformed message from %s", peer)
                     continue
+
+                if isinstance(msg, HelloMessage):
+                    dev_name = msg.device_name or f"Device ({peer})"
+                    if self._device_manager and self._device_manager.is_blocked(name=dev_name, ip=peer_ip, dev_id=dev_id):
+                        logger.warning("Rejecting blocked device %s (%s)", dev_name, peer)
+                        await ws.close(4003, "Blocked by host")
+                        return
+
+                    def close_client() -> None:
+                        asyncio.create_task(ws.close(4008, "Disconnected by host"))
+
+                    dev = ConnectedDevice(
+                        id=dev_id,
+                        name=dev_name,
+                        transport="Local Wi-Fi",
+                        ip=peer_ip,
+                        connected_at=time.time(),
+                        disconnect_fn=close_client,
+                        is_relay=False,
+                    )
+                    if self._device_manager:
+                        if not self._device_manager.register_device(dev):
+                            await ws.close(4003, "Blocked by host")
+                            return
+                        device_registered = True
 
                 await self._dispatch(ws, msg, session, peer)
         except websockets.ConnectionClosed as exc:
@@ -242,6 +321,8 @@ class LocalWebSocketServer:
         except Exception:
             logger.exception("Unexpected error in client handler for %s", peer)
         finally:
+            if device_registered and self._device_manager:
+                self._device_manager.unregister_device(dev_id)
             await self._stop_screen_stream(session)
             await self._stop_volume_sync(session)
             self._smoother.reset()
@@ -462,6 +543,11 @@ class LocalWebSocketServer:
                 if callable(self._mic_device_provider)
                 else None
             )
+            connected_count = (
+                self._device_manager.get_count()
+                if self._device_manager is not None
+                else len(self._clients)
+            )
             await ws.send(
                 encode_hello_ack(
                     self.pc_name,
@@ -469,6 +555,7 @@ class LocalWebSocketServer:
                     file_port=self.file_port,
                     mic_port=self.mic_port,
                     mic_device=mic_device,
+                    connected_count=connected_count,
                 )
             )
         elif isinstance(msg, UnknownMessage):

@@ -13,6 +13,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -220,7 +221,9 @@ fun TouchpadScreen(
                 )
             }
             ControlPanelTab.POWER -> {
-                PowerControlPanel(onPowerAction = viewModel::sendPowerAction)
+                PowerControlPanel(
+                    onPowerAction = viewModel::sendPowerAction,
+                )
             }
             ControlPanelTab.PPT -> {
                 PptControlPanel(onKeyCombo = viewModel::sendKeyCombo)
@@ -602,11 +605,18 @@ private fun TopRemoteToolbar(
                             .background(statusDotColor),
                     )
                     val pcChipLabel = when (val st = connectionState) {
-                        is ConnectionState.Connected -> when (st.transportMode) {
-                            TransportMode.LAN -> "Wi-Fi"
-                            TransportMode.P2P_DIRECT -> "P2P"
-                            TransportMode.P2P_CONNECTING -> "P2P…"
-                            TransportMode.VPS_RELAY -> "VPS"
+                        is ConnectionState.Connected -> {
+                            val modeStr = when (st.transportMode) {
+                                TransportMode.LAN -> "Wi-Fi"
+                                TransportMode.P2P_DIRECT -> "P2P"
+                                TransportMode.P2P_CONNECTING -> "P2P…"
+                                TransportMode.VPS_RELAY -> "VPS"
+                            }
+                            if (st.connectedDevicesCount > 1) {
+                                "$modeStr (${st.connectedDevicesCount})"
+                            } else {
+                                modeStr
+                            }
                         }
                         else -> "PC"
                     }
@@ -752,6 +762,24 @@ private fun ConnectionDrawerPanel(
                 }
             }
 
+            if (state is ConnectionState.Connected) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(RemoteColors.TileBg)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                ) {
+                    Text(
+                        text = "📱 Remote connected device(s): ${state.connectedDevicesCount}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = RemoteColors.NeonCyan,
+                    )
+                }
+            }
+
             // Local Wi-Fi vs Internet (VPS Relay) switcher when disconnected
             if (!isConnected) {
                 Row(
@@ -846,6 +874,7 @@ private fun ConnectionDrawerPanel(
                         value = relayDeviceId,
                         onValueChange = onRelayDeviceIdChange,
                         label = { Text("PC ID") },
+                        placeholder = { Text("e.g. my-pc") },
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                     )
@@ -853,13 +882,14 @@ private fun ConnectionDrawerPanel(
                         value = relayToken,
                         onValueChange = onRelayTokenChange,
                         label = { Text("Token") },
+                        placeholder = { Text("Secret Token") },
                         singleLine = true,
                         modifier = Modifier.weight(1.2f),
                     )
                 }
                 Button(
                     onClick = onConnectRelay,
-                    enabled = !isConnecting && relayUrl.isNotBlank() && relayDeviceId.isNotBlank(),
+                    enabled = !isConnecting && relayUrl.isNotBlank() && relayDeviceId.isNotBlank() && relayToken.isNotBlank(),
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(44.dp),

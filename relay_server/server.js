@@ -29,8 +29,26 @@ const MAX_AUTH_FAILS = 15;
 const authFailures = new Map(); // ip -> { count, resetAt }
 
 // Active rooms keyed by deviceId:
-// deviceId -> { hostWs, controllerWs, tokenHash: Buffer, hostName: string }
+// deviceId -> { hostWs, controllers: Map<string, { ws, name, ip, connectedAt }>, tokenHash: Buffer, hostName: string, blockedDevices: Set<string> }
 const rooms = new Map();
+
+function broadcastDeviceList(room) {
+  if (!room) return;
+  const list = [];
+  for (const [cid, c] of room.controllers.entries()) {
+    list.push({ id: cid, name: c.name, ip: c.ip, connectedAt: c.connectedAt });
+  }
+  const updateMsg = { t: "devices_update", count: list.length, devices: list };
+  if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
+    sendJson(room.hostWs, updateMsg);
+  }
+  for (const [cid, c] of room.controllers.entries()) {
+    if (c.ws && c.ws.readyState === WebSocket.OPEN) {
+      const userSpecificDevices = list.map((d) => ({ ...d, is_you: d.id === cid }));
+      sendJson(c.ws, { t: "devices_update", count: list.length, devices: userSpecificDevices });
+    }
+  }
+}
 
 function sha256Buffer(text) {
   return crypto.createHash("sha256").update(text, "utf8").digest();
@@ -190,12 +208,124 @@ wss.on("connection", (ws, req) => {
     const room = rooms.get(ws.deviceId);
     if (!room) return;
 
-    const peer = ws.role === "host" ? room.controllerWs : room.hostWs;
-    if (peer && peer.readyState === WebSocket.OPEN) {
-      if (isBinary && ws.role === "host" && isScreenFrameBuffer(raw)) {
-        forwardScreenFrame(peer, raw);
+    if (ws.role === "host") {
+      // Host sending to controller(s)
+      if (isBinary) {
+        if (isScreenFrameBuffer(raw)) {
+          // Broadcast screen frame to all controllers
+          for (const c of room.controllers.values()) {
+            forwardScreenFrame(c.ws, raw);
+          }
+          return;
+        }
+        // Check if prefixed with RCID header: [4 bytes "RCID"][1 byte cid_len][cid_bytes][payload]
+        if (
+          raw.length >= 5 &&
+          raw[0] === 0x52 && // 'R'
+          raw[1] === 0x43 && // 'C'
+          raw[2] === 0x49 && // 'I'
+          raw[3] === 0x44    // 'D'
+        ) {
+          const cidLen = raw[4];
+          if (raw.length >= 5 + cidLen) {
+            const targetCid = raw.toString("utf8", 5, 5 + cidLen);
+            const payload = raw.subarray(5 + cidLen);
+            const target = room.controllers.get(targetCid);
+            if (target && target.ws.readyState === WebSocket.OPEN) {
+              if (isScreenFrameBuffer(payload)) {
+                forwardScreenFrame(target.ws, payload);
+              } else {
+                safeSend(target.ws, payload);
+              }
+            }
+            return;
+          }
+        }
+        // General binary broadcast
+        for (const c of room.controllers.values()) {
+          safeSend(c.ws, raw);
+        }
       } else {
-        safeSend(peer, isBinary ? raw : raw.toString("utf8"));
+        const text = raw.toString("utf8");
+        let parsed = null;
+        try {
+          parsed = JSON.parse(text);
+        } catch {}
+
+        if (parsed && typeof parsed === "object") {
+          // Host control commands
+          if (parsed.t === "disconnect_client") {
+            const target = room.controllers.get(parsed.clientId);
+            if (target) {
+              sendJson(target.ws, { t: "relay_error", code: "disconnected_by_host", message: "Disconnected by PC" });
+              try { target.ws.close(4000, "Disconnected by host"); } catch {}
+              room.controllers.delete(parsed.clientId);
+              broadcastDeviceList(room);
+            }
+            return;
+          }
+          if (parsed.t === "block_client") {
+            const target = room.controllers.get(parsed.clientId);
+            if (parsed.name) room.blockedDevices.add(parsed.name.toLowerCase());
+            if (parsed.ip) room.blockedDevices.add(parsed.ip);
+            if (parsed.clientId) room.blockedDevices.add(parsed.clientId);
+            if (target) {
+              if (target.name) room.blockedDevices.add(target.name.toLowerCase());
+              if (target.ip) room.blockedDevices.add(target.ip);
+              sendJson(target.ws, { t: "relay_error", code: "blocked", message: "Device has been blocked by host PC" });
+              try { target.ws.close(4003, "Blocked by host"); } catch {}
+              room.controllers.delete(parsed.clientId);
+            }
+            broadcastDeviceList(room);
+            return;
+          }
+          if (parsed.t === "unblock_device") {
+            if (parsed.identifier) {
+              room.blockedDevices.delete(parsed.identifier);
+              room.blockedDevices.delete(parsed.identifier.toLowerCase());
+            }
+            return;
+          }
+          if (parsed._to && parsed._to !== "all") {
+            // Targeted to single controller
+            const target = room.controllers.get(parsed._to);
+            if (target && target.ws.readyState === WebSocket.OPEN) {
+              safeSend(target.ws, text);
+            }
+            return;
+          }
+        }
+        // Broadcast to all controllers
+        for (const c of room.controllers.values()) {
+          safeSend(c.ws, text);
+        }
+      }
+    } else {
+      // Controller sending to host
+      const hostWs = room.hostWs;
+      if (!hostWs || hostWs.readyState !== WebSocket.OPEN) return;
+
+      if (isBinary) {
+        // Prefix with RCID: [4 bytes "RCID"][1 byte cid_len][cid_bytes][payload]
+        const cidBuf = Buffer.from(ws.clientId || "", "utf8");
+        const header = Buffer.alloc(5 + cidBuf.length);
+        header.write("RCID", 0, 4, "ascii");
+        header.writeUInt8(cidBuf.length, 4);
+        cidBuf.copy(header, 5);
+        const wrapped = Buffer.concat([header, raw]);
+        safeSend(hostWs, wrapped);
+      } else {
+        const text = raw.toString("utf8");
+        let parsed = null;
+        try {
+          parsed = JSON.parse(text);
+        } catch {}
+        if (parsed && typeof parsed === "object") {
+          parsed.cid = ws.clientId;
+          safeSend(hostWs, JSON.stringify(parsed));
+        } else {
+          safeSend(hostWs, text);
+        }
       }
     }
   });
@@ -257,14 +387,14 @@ function handleRegister(ws, raw, ip) {
           // ignore
         }
       }
-      // If token changed, kick any old controller so mismatched tokens cannot linger
-      if (existing.controllerWs && !tokensEqual(existing.tokenHash, tokenHash)) {
-        try {
-          existing.controllerWs.close(4003, "Token updated");
-        } catch {
-          // ignore
+      // If token changed, kick controllers with old token
+      if (!tokensEqual(existing.tokenHash, tokenHash)) {
+        for (const c of existing.controllers.values()) {
+          try {
+            c.ws.close(4003, "Token updated");
+          } catch {}
         }
-        existing.controllerWs = null;
+        existing.controllers.clear();
       }
       existing.hostWs = ws;
       existing.tokenHash = tokenHash;
@@ -272,7 +402,8 @@ function handleRegister(ws, raw, ip) {
     } else {
       rooms.set(deviceId, {
         hostWs: ws,
-        controllerWs: null,
+        controllers: new Map(),
+        blockedDevices: new Set(),
         tokenHash,
         hostName: typeof name === "string" && name.trim() ? name.trim().slice(0, 64) : deviceId,
       });
@@ -283,6 +414,7 @@ function handleRegister(ws, raw, ip) {
     ws.deviceId = deviceId;
     sendJson(ws, { t: "relay_ready", ok: true, role: "host", deviceId });
     console.log(`[relay] host registered: ${deviceId} (${rooms.get(deviceId).hostName}) from ${ip}`);
+    broadcastDeviceList(rooms.get(deviceId));
     return;
   }
 
@@ -301,29 +433,65 @@ function handleRegister(ws, raw, ip) {
     return;
   }
 
-  if (room.controllerWs && room.controllerWs !== ws) {
-    try {
-      room.controllerWs.close(4009, "Replaced by new phone connection");
-    } catch {
-      // ignore
+  const clientName = typeof name === "string" && name.trim() ? name.trim().slice(0, 64) : "Phone";
+  const reqClientId = typeof msg.clientId === "string" && msg.clientId.trim() ? msg.clientId.trim().slice(0, 64) : null;
+  const clientId = reqClientId || `c_${crypto.randomBytes(6).toString("hex")}`;
+
+  // Check if blocked
+  if (
+    room.blockedDevices.has(clientName.toLowerCase()) ||
+    room.blockedDevices.has(ip) ||
+    room.blockedDevices.has(clientId)
+  ) {
+    sendJson(ws, { t: "relay_error", code: "blocked", message: "Device has been blocked by host PC" });
+    ws.close(4003, "Blocked");
+    return;
+  }
+
+  // If same clientId is already in room, close previous connection cleanly
+  if (room.controllers.has(clientId)) {
+    const prev = room.controllers.get(clientId);
+    if (prev && prev.ws !== ws) {
+      try { prev.ws.close(4009, "Replaced by reconnecting device"); } catch {}
     }
   }
 
-  room.controllerWs = ws;
   ws.registered = true;
   ws.role = "controller";
   ws.deviceId = deviceId;
+  ws.clientId = clientId;
+  ws.clientName = clientName;
+  ws.clientIp = ip;
+  ws.connectedAt = Date.now();
+
+  room.controllers.set(clientId, {
+    ws,
+    name: clientName,
+    ip,
+    connectedAt: ws.connectedAt,
+  });
 
   sendJson(ws, {
     t: "relay_ready",
     ok: true,
     role: "controller",
     deviceId,
+    clientId,
     name: room.hostName,
     udpPort: UDP_PORT,
   });
-  sendJson(room.hostWs, { t: "relay_peer", online: true });
-  console.log(`[relay] controller joined: ${deviceId} from ${ip}`);
+
+  sendJson(room.hostWs, {
+    t: "relay_device_connected",
+    clientId,
+    cid: clientId,
+    name: clientName,
+    ip,
+    connectedAt: ws.connectedAt,
+  });
+  sendJson(room.hostWs, { t: "relay_peer", online: true, count: room.controllers.size });
+  broadcastDeviceList(room);
+  console.log(`[relay] controller joined: ${deviceId} (client=${clientId}, name=${clientName}) from ${ip}`);
 }
 
 function cleanupConnection(ws) {
@@ -335,22 +503,27 @@ function cleanupConnection(ws) {
 
   if (ws.role === "host" && room.hostWs === ws) {
     room.hostWs = null;
-    if (room.controllerWs && room.controllerWs.readyState === WebSocket.OPEN) {
-      sendJson(room.controllerWs, { t: "relay_peer", online: false });
-      try {
-        room.controllerWs.close(1001, "PC disconnected");
-      } catch {
-        // ignore
+    for (const c of room.controllers.values()) {
+      if (c.ws && c.ws.readyState === WebSocket.OPEN) {
+        sendJson(c.ws, { t: "relay_peer", online: false });
+        try {
+          c.ws.close(1001, "PC disconnected");
+        } catch {
+          // ignore
+        }
       }
     }
+    room.controllers.clear();
     rooms.delete(ws.deviceId);
     console.log(`[relay] host disconnected: ${ws.deviceId}`);
-  } else if (ws.role === "controller" && room.controllerWs === ws) {
-    room.controllerWs = null;
+  } else if (ws.role === "controller" && ws.clientId && room.controllers.has(ws.clientId)) {
+    room.controllers.delete(ws.clientId);
     if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
-      sendJson(room.hostWs, { t: "relay_peer", online: false });
+      sendJson(room.hostWs, { t: "relay_device_disconnected", clientId: ws.clientId, cid: ws.clientId });
+      sendJson(room.hostWs, { t: "relay_peer", online: room.controllers.size > 0, count: room.controllers.size });
     }
-    console.log(`[relay] controller disconnected: ${ws.deviceId}`);
+    broadcastDeviceList(room);
+    console.log(`[relay] controller disconnected: ${ws.deviceId} (client=${ws.clientId})`);
   }
 }
 

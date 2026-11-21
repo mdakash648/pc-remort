@@ -1,12 +1,16 @@
 package com.remotepad.app.ui.files
 
 import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,27 +30,46 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import coil.compose.SubcomposeAsyncImage
 import com.remotepad.app.network.ConnectionState
 import com.remotepad.app.network.FileTransferClient
 import com.remotepad.app.network.PcDrive
 import com.remotepad.app.network.PcFileEntry
 import com.remotepad.app.network.PcQuickDir
 import com.remotepad.app.network.TransportMode
+import com.remotepad.app.ui.theme.RemoteColors
 
 @Composable
 fun FileTransferScreen(
@@ -57,7 +80,14 @@ fun FileTransferScreen(
 ) {
     val browserState by viewModel.browserState.collectAsStateWithLifecycle()
     val transfers by viewModel.transfers.collectAsStateWithLifecycle()
+    val pendingShares by viewModel.pendingShares.collectAsStateWithLifecycle()
+    val isConnectingForShare by viewModel.isConnectingForShare.collectAsStateWithLifecycle()
+    val activePreview by viewModel.activePreview.collectAsStateWithLifecycle()
     val context = LocalContext.current
+
+    BackHandler(enabled = activePreview != null) {
+        viewModel.closePreview()
+    }
 
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
@@ -68,47 +98,47 @@ fun FileTransferScreen(
     }
 
     val connected = connectionState as? ConnectionState.Connected
-    val canTransferFiles = connected != null && (
-        (connected.transportMode == TransportMode.LAN && !connected.viaRelay && connected.host.isNotBlank()) ||
-            connected.transportMode == TransportMode.P2P_DIRECT
-        )
-    if (!canTransferFiles || connected == null) {
+    val canTransferFiles = connected != null
+    if (!canTransferFiles) {
         Box(
             modifier = modifier
                 .fillMaxSize()
                 .padding(16.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(MaterialTheme.colorScheme.surface)
-                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))
-                    .padding(20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Text(
-                    text = "File Transfer",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
+            if (pendingShares.isNotEmpty()) {
+                PendingShareCard(
+                    pendingShares = pendingShares,
+                    isConnecting = isConnectingForShare || connectionState is ConnectionState.Connecting,
+                    onRetry = viewModel::retryConnectingForShare,
+                    onCancel = viewModel::cancelPendingShares,
+                    onGoToTouchpad = onGoToTouchpad,
                 )
-                Text(
-                    text = when (connected?.transportMode) {
-                        TransportMode.P2P_CONNECTING ->
-                            "Establishing Direct P2P connection... File Transfer will unlock automatically once Direct P2P connects."
-                        TransportMode.VPS_RELAY ->
-                            "You are connected via VPS Relay. File Transfer is available on Local Wi-Fi and Direct P2P only (disabled on VPS Relay)."
-                        else ->
-                            "Connect to your PC on the Touchpad tab first to send or receive files over Local Wi-Fi or Direct P2P."
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Button(onClick = onGoToTouchpad) {
-                    Text("Go to Touchpad")
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))
+                        .padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(
+                        text = "File Transfer",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "Connect to your PC on the Touchpad tab first to browse, download, or send files.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(onClick = onGoToTouchpad) {
+                        Text("Go to Touchpad")
+                    }
                 }
             }
         }
@@ -134,12 +164,13 @@ fun FileTransferScreen(
         "Saves to: Downloads\\RemotePad"
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
         // Phone -> PC Send Action Card
         Column(
             modifier = Modifier
@@ -397,6 +428,7 @@ fun FileTransferScreen(
                         PcFileRow(
                             entry = entry,
                             onOpenDir = { viewModel.openDirectory(entry.path) },
+                            onPreview = { viewModel.openPreview(entry) },
                             onDownload = { viewModel.downloadEntry(entry) },
                         )
                     }
@@ -404,6 +436,18 @@ fun FileTransferScreen(
             }
         }
     }
+
+    activePreview?.let { preview ->
+        MediaPreviewOverlay(
+            preview = preview,
+            onClose = viewModel::closePreview,
+            onDownload = {
+                viewModel.downloadEntry(preview.entry)
+                Toast.makeText(context, "Downloading ${preview.entry.name}...", Toast.LENGTH_SHORT).show()
+            },
+        )
+    }
+}
 }
 
 @Composable
@@ -747,15 +791,41 @@ private fun TransferRow(
 private fun PcFileRow(
     entry: PcFileEntry,
     onOpenDir: () -> Unit,
+    onPreview: () -> Unit,
     onDownload: () -> Unit,
 ) {
+    val category = entry.getCategory()
+    val isMedia = category == FileCategory.IMAGE || category == FileCategory.VIDEO || category == FileCategory.AUDIO
+
+    val badgeText = when (category) {
+        FileCategory.DIRECTORY -> "DIR"
+        FileCategory.IMAGE -> "IMG"
+        FileCategory.VIDEO -> "VID"
+        FileCategory.AUDIO -> "AUD"
+        FileCategory.DOCUMENT -> "DOC"
+        FileCategory.OTHER -> "FILE"
+    }
+
+    val badgeColor = when (category) {
+        FileCategory.DIRECTORY -> MaterialTheme.colorScheme.primary
+        FileCategory.IMAGE -> Color(0xFFB388FF)
+        FileCategory.VIDEO -> RemoteColors.MediaOrange
+        FileCategory.AUDIO -> RemoteColors.ConnectedGreen
+        FileCategory.DOCUMENT -> Color(0xFF64B5F6)
+        FileCategory.OTHER -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .clickable {
-                if (entry.isDir) onOpenDir() else onDownload()
+                when {
+                    entry.isDir -> onOpenDir()
+                    isMedia -> onPreview()
+                    else -> onDownload()
+                }
             }
             .padding(horizontal = 10.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -766,18 +836,14 @@ private fun PcFileRow(
                 .width(38.dp)
                 .height(26.dp)
                 .clip(RoundedCornerShape(6.dp))
-                .background(
-                    if (entry.isDir) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
-                    else MaterialTheme.colorScheme.surface
-                ),
+                .background(badgeColor.copy(alpha = 0.18f)),
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = if (entry.isDir) "DIR" else "FILE",
+                text = badgeText,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
-                color = if (entry.isDir) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.onSurfaceVariant,
+                color = badgeColor,
             )
         }
 
@@ -806,24 +872,18 @@ private fun PcFileRow(
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
             )
-        } else {
-            Box(
-                modifier = Modifier
-                    .height(30.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
-                    .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
-                    .clickable(onClick = onDownload)
-                    .padding(horizontal = 10.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "Get",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.primary,
-                )
+        } else if (category == FileCategory.IMAGE) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                SmallActionChip(label = "View", enabled = true, highlightColor = RemoteColors.NeonCyan, onClick = onPreview)
+                SmallActionChip(label = "Get", enabled = true, onClick = onDownload)
             }
+        } else if (category == FileCategory.VIDEO || category == FileCategory.AUDIO) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                SmallActionChip(label = "Play", enabled = true, highlightColor = RemoteColors.MediaOrange, onClick = onPreview)
+                SmallActionChip(label = "Get", enabled = true, onClick = onDownload)
+            }
+        } else {
+            SmallActionChip(label = "Get", enabled = true, onClick = onDownload)
         }
     }
 }
@@ -832,24 +892,466 @@ private fun PcFileRow(
 private fun SmallActionChip(
     label: String,
     enabled: Boolean,
+    highlightColor: Color? = null,
     onClick: () -> Unit,
 ) {
+    val bg = highlightColor?.copy(alpha = 0.22f) ?: MaterialTheme.colorScheme.surfaceVariant
+    val borderCol = highlightColor?.copy(alpha = 0.65f) ?: MaterialTheme.colorScheme.outline
+    val txtCol = highlightColor ?: if (enabled) MaterialTheme.colorScheme.onSurface
+    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
     Box(
         modifier = Modifier
             .height(28.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+            .background(bg)
+            .border(1.dp, borderCol, RoundedCornerShape(8.dp))
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 10.dp),
+            .padding(horizontal = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             text = label,
             fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            color = if (enabled) MaterialTheme.colorScheme.onSurface
-            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+            fontWeight = if (highlightColor != null) FontWeight.Bold else FontWeight.Medium,
+            color = txtCol,
         )
+    }
+}
+
+@Composable
+private fun MediaPreviewOverlay(
+    preview: ActiveMediaPreview,
+    onClose: () -> Unit,
+    onDownload: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+    ) {
+        when (preview.category) {
+            FileCategory.IMAGE -> {
+                ImageViewerModal(
+                    preview = preview,
+                    onClose = onClose,
+                    onDownload = onDownload,
+                )
+            }
+            FileCategory.VIDEO, FileCategory.AUDIO -> {
+                VideoPlayerModal(
+                    preview = preview,
+                    onClose = onClose,
+                    onDownload = onDownload,
+                )
+            }
+            else -> Unit
+        }
+    }
+}
+
+@Composable
+private fun ImageViewerModal(
+    preview: ActiveMediaPreview,
+    onClose: () -> Unit,
+    onDownload: () -> Unit,
+) {
+    val context = LocalContext.current
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            scale = if (scale > 1f) 1f else 2.5f
+                            offset = Offset.Zero
+                        }
+                    )
+                }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        scale = (scale * zoom).coerceIn(0.7f, 6f)
+                        if (scale > 1f) {
+                            offset += pan
+                        } else {
+                            offset = Offset.Zero
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            SubcomposeAsyncImage(
+                model = preview.streamUrl,
+                contentDescription = preview.entry.name,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offset.x,
+                        translationY = offset.y,
+                    ),
+                loading = {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(
+                            color = RemoteColors.NeonCyan,
+                            strokeWidth = 3.dp,
+                            modifier = Modifier.size(40.dp),
+                        )
+                    }
+                },
+                error = {
+                    Column(
+                        Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text(
+                            text = "Failed to load image from PC",
+                            color = RemoteColors.DangerRed,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "Make sure PC Agent is running and file exists",
+                            color = RemoteColors.TextMuted,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                },
+            )
+        }
+
+        // Top Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .background(Color.Black.copy(alpha = 0.72f))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.15f))
+                    .clickable(onClick = onClose),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("✕", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = preview.entry.name,
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = "${FileTransferClient.formatBytes(preview.entry.size)} • Direct Preview",
+                    color = RemoteColors.NeonCyan,
+                    fontSize = 11.sp,
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.White.copy(alpha = 0.15f))
+                    .clickable {
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(Uri.parse(preview.streamUrl), "image/*")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        runCatching {
+                            context.startActivity(Intent.createChooser(intent, "Open with"))
+                        }
+                    }
+                    .padding(horizontal = 9.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("Open In", fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.Medium)
+            }
+
+            Box(
+                modifier = Modifier
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(RemoteColors.NeonCyan.copy(alpha = 0.25f))
+                    .border(1.dp, RemoteColors.NeonCyan.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                    .clickable(onClick = onDownload)
+                    .padding(horizontal = 9.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("Save", fontSize = 11.sp, color = RemoteColors.NeonCyan, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun VideoPlayerModal(
+    preview: ActiveMediaPreview,
+    onClose: () -> Unit,
+    onDownload: () -> Unit,
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val exoPlayer = remember(preview.streamUrl) {
+        ExoPlayer.Builder(context).build().apply {
+            val mediaItem = MediaItem.fromUri(Uri.parse(preview.streamUrl))
+            setMediaItem(mediaItem)
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, exoPlayer) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                exoPlayer.pause()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            exoPlayer.release()
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    this.player = exoPlayer
+                    useController = true
+                    setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+                    setShowNextButton(false)
+                    setShowPreviousButton(false)
+                    setShowFastForwardButton(true)
+                    setShowRewindButton(true)
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .background(Color.Black.copy(alpha = 0.75f))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.15f))
+                    .clickable(onClick = onClose),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("✕", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = preview.entry.name,
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = "${FileTransferClient.formatBytes(preview.entry.size)} • Streaming from PC",
+                    color = RemoteColors.MediaOrange,
+                    fontSize = 11.sp,
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.White.copy(alpha = 0.15f))
+                    .clickable {
+                        val mimeType = if (preview.category == FileCategory.AUDIO) "audio/*" else "video/*"
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(Uri.parse(preview.streamUrl), mimeType)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        runCatching {
+                            context.startActivity(Intent.createChooser(intent, "Play with"))
+                        }
+                    }
+                    .padding(horizontal = 9.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("External", fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.Medium)
+            }
+
+            Box(
+                modifier = Modifier
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(RemoteColors.NeonCyan.copy(alpha = 0.25f))
+                    .border(1.dp, RemoteColors.NeonCyan.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                    .clickable(onClick = onDownload)
+                    .padding(horizontal = 9.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("Save", fontSize = 11.sp, color = RemoteColors.NeonCyan, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingShareCard(
+    pendingShares: List<PendingShareItem>,
+    isConnecting: Boolean,
+    onRetry: () -> Unit,
+    onCancel: () -> Unit,
+    onGoToTouchpad: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(RemoteColors.PanelBg)
+            .border(
+                1.dp,
+                if (isConnecting) RemoteColors.NeonCyan.copy(alpha = 0.6f)
+                else RemoteColors.ConnectingAmber.copy(alpha = 0.6f),
+                RoundedCornerShape(16.dp),
+            )
+            .padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        if (isConnecting) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(36.dp),
+                color = RemoteColors.NeonCyan,
+                strokeWidth = 3.dp,
+            )
+            Text(
+                text = "Connecting to PC...",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = RemoteColors.TextPrimary,
+            )
+            val fileCount = pendingShares.size
+            val countLabel = if (fileCount == 1) "1 file ready to send" else "$fileCount files ready to send"
+            Text(
+                text = "$countLabel. Upload will begin automatically as soon as PC is connected.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = RemoteColors.TextMuted,
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .clip(CircleShape)
+                    .background(RemoteColors.DangerRed),
+            )
+            Text(
+                text = "PC Not Connected",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = RemoteColors.TextPrimary,
+            )
+            Text(
+                text = "Could not reach PC. Make sure PC Agent is running and both devices are on the same Wi-Fi.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = RemoteColors.TextMuted,
+            )
+        }
+
+        // List of queued files
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(RemoteColors.TileBg)
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            pendingShares.take(5).forEach { item ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = item.fileName,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        color = RemoteColors.TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Text(
+                        text = FileTransferClient.formatBytes(item.fileSize),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = RemoteColors.TextMuted,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+            }
+            if (pendingShares.size > 5) {
+                Text(
+                    text = "+${pendingShares.size - 5} more files...",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = RemoteColors.NeonCyan,
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+        ) {
+            if (!isConnecting) {
+                Button(
+                    onClick = onRetry,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = RemoteColors.NeonCyan,
+                        contentColor = Color(0xFF001D2B),
+                    ),
+                ) {
+                    Text("Retry Connect", fontWeight = FontWeight.SemiBold)
+                }
+                Button(
+                    onClick = onGoToTouchpad,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                    ),
+                ) {
+                    Text("Settings")
+                }
+            }
+            OutlinedButton(
+                onClick = onCancel,
+            ) {
+                Text("Cancel")
+            }
+        }
     }
 }

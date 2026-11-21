@@ -345,6 +345,12 @@ class P2PUdpClient {
     var onScreenFrame: ((ScreenFramePacket) -> Unit)? = null
 
     @Volatile
+    var sendWebSocketBinary: ((ByteArray) -> Boolean)? = null
+
+    val canSendFilePackets: Boolean
+        get() = isConnected || sendWebSocketBinary != null
+
+    @Volatile
     private var stunNonce: String = ""
 
     @Volatile
@@ -490,7 +496,15 @@ class P2PUdpClient {
 
     fun currentAuthTag(): ByteArray? {
         val tag = authTag
-        return if (isConnected && tag.size == 8) tag else null
+        return if (tag.size == 8) tag else null
+    }
+
+    fun ensureAuthTag(token: String? = null): ByteArray {
+        var tag = authTag
+        if (tag.size == 8) return tag
+        tag = P2PWire.deriveAuthTag(token ?: "remotepad-session", currentSid.ifBlank { "session" })
+        authTag = tag
+        return tag
     }
 
     fun registerFileListener(xferId: Int, listener: (UnpackedFilePacket) -> Unit) {
@@ -502,15 +516,33 @@ class P2PUdpClient {
     }
 
     fun sendRawFilePacket(packetBytes: ByteArray): Boolean {
-        val socket = udpSocket ?: return false
-        val target = peerAddress ?: return false
-        if (_state.value !is P2PState.Connected || socket.isClosed) {
-            return false
+        if (isConnected) {
+            val socket = udpSocket
+            val target = peerAddress
+            if (socket != null && !socket.isClosed && target != null) {
+                val sent = runCatching {
+                    socket.send(DatagramPacket(packetBytes, packetBytes.size, target))
+                    true
+                }.getOrDefault(false)
+                if (sent) return true
+            }
         }
-        return runCatching {
-            socket.send(DatagramPacket(packetBytes, packetBytes.size, target))
-            true
-        }.getOrDefault(false)
+        val wsSender = sendWebSocketBinary
+        if (wsSender != null) {
+            return wsSender.invoke(packetBytes)
+        }
+        return false
+    }
+
+    fun onRawFilePacketReceived(buf: ByteArray) {
+        val len = buf.size
+        if (len >= P2PWire.FILE_HEADER_SIZE && P2PWire.isFilePacketType(buf[4])) {
+            val filePkt = P2PWire.unpackFilePacket(buf, len) ?: return
+            val tag = authTag
+            if (tag.size == 8 && !P2PWire.constantTimeEquals(filePkt.authTag, tag)) return
+            lastRxElapsedMs = SystemClock.elapsedRealtime()
+            fileListeners[filePkt.xferId]?.invoke(filePkt)
+        }
     }
 
     private fun abortAllFileListeners(reason: String) {

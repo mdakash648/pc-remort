@@ -154,6 +154,12 @@ class PingMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class DevicesUpdateMessage:
+    count: int
+    devices: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class UnknownMessage:
     msg_type: str
 
@@ -179,6 +185,7 @@ ParsedMessage = Union[
     ScreenConfigMessage,
     ScreenAckMessage,
     PingMessage,
+    DevicesUpdateMessage,
     UnknownMessage,
 ]
 
@@ -435,6 +442,13 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
     if msg_type == "ping":
         return PingMessage()
 
+    if msg_type == "devices_update":
+        raw_count = data.get("count", 0)
+        raw_devs = data.get("devices", [])
+        devs = tuple(raw_devs) if isinstance(raw_devs, list) else ()
+        cnt = int(raw_count) if isinstance(raw_count, int) else len(devs)
+        return DevicesUpdateMessage(count=cnt, devices=devs)
+
     return UnknownMessage(msg_type=msg_type)
 
 
@@ -444,6 +458,7 @@ def encode_hello_ack(
     file_port: int | None = None,
     mic_port: int | None = None,
     mic_device: str | None = None,
+    connected_count: int | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "t": "hello_ack",
@@ -451,6 +466,8 @@ def encode_hello_ack(
         "ok": ok,
         "name": pc_name,
     }
+    if connected_count is not None:
+        payload["connected_count"] = max(1, connected_count)
     if file_port is not None:
         payload["file_port"] = file_port
     if mic_port is not None:
@@ -471,6 +488,17 @@ def encode_vol_state(level: float, muted: bool) -> str:
             "t": "vol_state",
             "v": clamped,
             "muted": bool(muted),
+        },
+        separators=(",", ":"),
+    )
+
+
+def encode_devices_update(count: int, devices: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "t": "devices_update",
+            "count": count,
+            "devices": devices,
         },
         separators=(",", ":"),
     )

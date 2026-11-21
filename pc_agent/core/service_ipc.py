@@ -44,6 +44,9 @@ def _status_to_dict(status: AgentStatus, *, running_as_system: bool) -> dict[str
         "mic_status": status.mic_status,
         "received_files_dir": status.received_files_dir,
         "running_as_system": running_as_system,
+        "connected_devices": list(status.connected_devices),
+        "connected_devices_count": status.connected_devices_count,
+        "blocked_devices": list(status.blocked_devices),
     }
 
 
@@ -63,6 +66,9 @@ def _status_from_dict(data: dict[str, Any]) -> tuple[AgentStatus, bool]:
         lan_clients_count=int(data.get("lan_clients_count", 0)),
         mic_status=str(data.get("mic_status", "")),
         received_files_dir=str(data.get("received_files_dir", "")),
+        connected_devices=tuple(dict(d) for d in data.get("connected_devices", ())),
+        connected_devices_count=int(data.get("connected_devices_count", 0)),
+        blocked_devices=tuple(dict(b) for b in data.get("blocked_devices", ())),
     )
     return status, bool(data.get("running_as_system", False))
 
@@ -275,6 +281,21 @@ class ServiceIpcServer:
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
+        if cmd == "disconnect_device":
+            device_id = str(req.get("device_id", "")).strip()
+            res = self._runtime.disconnect_device(device_id)
+            return {"ok": res}
+
+        if cmd == "block_device":
+            device_id = str(req.get("device_id", "")).strip()
+            res = self._runtime.block_device(device_id)
+            return {"ok": res}
+
+        if cmd == "unblock_device":
+            identifier = str(req.get("identifier", "")).strip()
+            res = self._runtime.unblock_device(identifier)
+            return {"ok": res}
+
         if cmd == "shutdown":
             logger.info("Service IPC received user shutdown request")
             if self._on_shutdown_requested is not None:
@@ -435,8 +456,23 @@ class RemoteAgentProxy:
                     lan_clients_count=0,
                     mic_status=prev.mic_status,
                     received_files_dir=prev.received_files_dir,
+                    connected_devices=(),
+                    connected_devices_count=0,
+                    blocked_devices=prev.blocked_devices,
                 )
             raise
+
+    def disconnect_device(self, device_id: str) -> bool:
+        resp = self._request({"cmd": "disconnect_device", "device_id": device_id}, timeout=3.0)
+        return bool(resp.get("ok"))
+
+    def block_device(self, device_id: str) -> bool:
+        resp = self._request({"cmd": "block_device", "device_id": device_id}, timeout=3.0)
+        return bool(resp.get("ok"))
+
+    def unblock_device(self, identifier: str) -> bool:
+        resp = self._request({"cmd": "unblock_device", "identifier": identifier}, timeout=3.0)
+        return bool(resp.get("ok"))
 
     def update_relay_settings(
         self,

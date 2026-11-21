@@ -236,7 +236,12 @@ async def _run(config: AgentConfig) -> None:
         await discovery.start()
 
     relay_client: RelayClient | None = None
-    if config.relay_enabled and config.relay_url.strip():
+    if (
+        config.relay_enabled
+        and config.relay_url.strip()
+        and config.relay_device_id.strip()
+        and config.relay_token.strip()
+    ):
         relay_client = RelayClient(
             server=server,
             relay_url=config.relay_url,

@@ -75,6 +75,7 @@ private val QUICK_SHORTCUTS = listOf(
     ShortcutSpec("Undo", listOf("ctrl", "z")),
     ShortcutSpec("Redo", listOf("ctrl", "y")),
     ShortcutSpec("Select All", listOf("ctrl", "a")),
+    ShortcutSpec("Screenshot", listOf("win", "shift", "s")),
     ShortcutSpec("Save", listOf("ctrl", "s")),
     ShortcutSpec("Find", listOf("ctrl", "f")),
     ShortcutSpec("Close", listOf("ctrl", "w")),
@@ -249,6 +250,16 @@ fun KeyboardPanel(
                     onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onKeyCombo(listOf("alt", "tab"))
+                    },
+                )
+
+                // Screenshot (Win+Shift+S) button right next to Switch
+                SmallBarButton(
+                    label = "Screenshot",
+                    highlighted = false,
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onKeyCombo(listOf("win", "shift", "s"))
                     },
                 )
             }

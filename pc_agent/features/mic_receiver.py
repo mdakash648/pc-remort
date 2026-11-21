@@ -476,6 +476,14 @@ class MicReceiverService:
     def refresh_device(self) -> str:
         return self._sink.refresh_device()
 
+    def feed_packet(self, data: bytes) -> None:
+        """Feed a raw RMIC packet into the audio sink (used for WebSocket tunnel fallback)."""
+        parsed = parse_mic_packet(data)
+        if parsed is None:
+            return
+        _seq, pcm = parsed
+        self._sink.write_pcm(pcm)
+
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

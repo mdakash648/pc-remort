@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -235,7 +236,14 @@ fun RemoteScreenView(
         screenVm.setScreenVisible(true)
         onDispose {
             screenVm.setScreenVisible(false)
+            touchpadVm.setKeyboardOpen(false)
         }
+    }
+
+    BackHandler(enabled = showKeyboard) {
+        keyboardController?.hide()
+        showKeyboard = false
+        touchpadVm.setKeyboardOpen(false)
     }
 
     // Reset zoom & re-sync local cursor on orientation or monitor change
@@ -269,12 +277,17 @@ fun RemoteScreenView(
         tapRippleTick += 1
     }
 
-    BoxWithConstraints(
+    Column(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFF05070B))
             .imePadding(),
     ) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+        ) {
         val containerW = with(density) { maxWidth.toPx() }
         val containerH = with(density) { maxHeight.toPx() }
 
@@ -975,96 +988,59 @@ fun RemoteScreenView(
         }
 
         // 3. Expanded Floating Sub-Panels (Actions / Quality) above bottom overlay
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            AnimatedVisibility(
-                visible = activeSubPanel == FloatingSubPanel.ACTIONS && !showKeyboard,
-                enter = fadeIn() + expandVertically(),
-                exit = fadeOut() + shrinkVertically(),
+        if (!showKeyboard) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                FloatingActionsBar(
-                    onKeyCombo = { keys ->
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        touchpadVm.sendKeyCombo(keys)
-                    },
-                    onSpecialKey = { key ->
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        touchpadVm.sendSpecialKey(key)
-                    },
-                    onRightClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        if (useLocalCursor) {
-                            screenVm.onDirectClick(localCursorX, localCursorY, MouseButton.RIGHT, 1)
-                        } else {
-                            touchpadVm.onClick(MouseButton.RIGHT, 1)
-                        }
-                    },
-                    onRefresh = {
-                        screenVm.refreshFrame()
-                        Toast.makeText(context, "Refreshing screen...", Toast.LENGTH_SHORT).show()
-                    },
-                    onClose = { activeSubPanel = FloatingSubPanel.NONE },
-                )
-            }
-
-            AnimatedVisibility(
-                visible = activeSubPanel == FloatingSubPanel.QUALITY && !showKeyboard,
-                enter = fadeIn() + expandVertically(),
-                exit = fadeOut() + shrinkVertically(),
-            ) {
-                FloatingQualityBar(
-                    selected = uiState.quality,
-                    onSelect = { q ->
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        screenVm.setQuality(q)
-                        activeSubPanel = FloatingSubPanel.NONE
-                    },
-                    onClose = { activeSubPanel = FloatingSubPanel.NONE },
-                )
-            }
-
-            // 4. Floating Keyboard Overlay (Full KeyboardPanel with Live + Paragraph + Modifiers + Shortcuts)
-            AnimatedVisibility(
-                visible = showKeyboard,
-                enter = fadeIn() + expandVertically(),
-                exit = fadeOut() + shrinkVertically(),
-            ) {
-                KeyboardPanel(
-                    modifierStates = modifierStates,
-                    isMicEnabled = isMicEnabled,
-                    onToggleMic = {
-                        if (isMicEnabled) {
-                            touchpadVm.setMicEnabled(false)
-                        } else if (!isConnected) {
-                            Toast.makeText(context, "Connect to PC first", Toast.LENGTH_SHORT).show()
-                        } else {
-                            val granted = ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.RECORD_AUDIO,
-                            ) == PackageManager.PERMISSION_GRANTED
-                            if (granted) {
-                                touchpadVm.setMicEnabled(true)
+                AnimatedVisibility(
+                    visible = activeSubPanel == FloatingSubPanel.ACTIONS,
+                    enter = fadeIn() + expandVertically(),
+                    exit = fadeOut() + shrinkVertically(),
+                ) {
+                    FloatingActionsBar(
+                        onKeyCombo = { keys ->
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            touchpadVm.sendKeyCombo(keys)
+                        },
+                        onSpecialKey = { key ->
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            touchpadVm.sendSpecialKey(key)
+                        },
+                        onRightClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            if (useLocalCursor) {
+                                screenVm.onDirectClick(localCursorX, localCursorY, MouseButton.RIGHT, 1)
                             } else {
-                                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                touchpadVm.onClick(MouseButton.RIGHT, 1)
                             }
-                        }
-                    },
-                    onToggleModifier = touchpadVm::toggleModifier,
-                    onReleaseAllModifiers = touchpadVm::releaseAllModifiers,
-                    onSpecialKey = touchpadVm::sendSpecialKey,
-                    onKeyCombo = touchpadVm::sendKeyCombo,
-                    onTypeText = touchpadVm::sendTypedText,
-                    onPasteParagraph = touchpadVm::sendParagraphText,
-                    onClose = {
-                        keyboardController?.hide()
-                        showKeyboard = false
-                    },
-                )
+                        },
+                        onRefresh = {
+                            screenVm.refreshFrame()
+                            Toast.makeText(context, "Refreshing screen...", Toast.LENGTH_SHORT).show()
+                        },
+                        onClose = { activeSubPanel = FloatingSubPanel.NONE },
+                    )
+                }
+
+                AnimatedVisibility(
+                    visible = activeSubPanel == FloatingSubPanel.QUALITY,
+                    enter = fadeIn() + expandVertically(),
+                    exit = fadeOut() + shrinkVertically(),
+                ) {
+                    FloatingQualityBar(
+                        selected = uiState.quality,
+                        onSelect = { q ->
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            screenVm.setQuality(q)
+                            activeSubPanel = FloatingSubPanel.NONE
+                        },
+                        onClose = { activeSubPanel = FloatingSubPanel.NONE },
+                    )
+                }
             }
         }
 
@@ -1219,6 +1195,7 @@ fun RemoteScreenView(
                                     menuExpanded = false
                                     activeSubPanel = FloatingSubPanel.NONE
                                     showKeyboard = true
+                                    touchpadVm.setKeyboardOpen(true)
                                 },
                             contentAlignment = Alignment.Center,
                         ) {
@@ -1260,6 +1237,53 @@ fun RemoteScreenView(
             }
         }
     }
+
+    // 4. Keyboard Panel placed BELOW the PC Screen Canvas (never covers taskbar or bottom content)
+    AnimatedVisibility(
+        visible = showKeyboard,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            KeyboardPanel(
+                modifierStates = modifierStates,
+                isMicEnabled = isMicEnabled,
+                onToggleMic = {
+                    if (isMicEnabled) {
+                        touchpadVm.setMicEnabled(false)
+                    } else if (!isConnected) {
+                        Toast.makeText(context, "Connect to PC first", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val granted = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO,
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (granted) {
+                            touchpadVm.setMicEnabled(true)
+                        } else {
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    }
+                },
+                onToggleModifier = touchpadVm::toggleModifier,
+                onReleaseAllModifiers = touchpadVm::releaseAllModifiers,
+                onSpecialKey = touchpadVm::sendSpecialKey,
+                onKeyCombo = touchpadVm::sendKeyCombo,
+                onTypeText = touchpadVm::sendTypedText,
+                onPasteParagraph = touchpadVm::sendParagraphText,
+                onClose = {
+                    keyboardController?.hide()
+                    showKeyboard = false
+                    touchpadVm.setKeyboardOpen(false)
+                },
+            )
+        }
+    }
+}
 }
 
 @Composable
@@ -1449,6 +1473,7 @@ private fun FloatingActionsBar(
         ) {
             ActionPill("Right Click", onClick = onRightClick)
             ActionPill("Alt+Tab") { onKeyCombo(listOf("alt", "tab")) }
+            ActionPill("Screenshot") { onKeyCombo(listOf("win", "shift", "s")) }
             ActionPill("Win") { onSpecialKey("win") }
             ActionPill("Desktop") { onKeyCombo(listOf("win", "d")) }
             ActionPill("Task Mgr") { onKeyCombo(listOf("ctrl", "shift", "esc")) }

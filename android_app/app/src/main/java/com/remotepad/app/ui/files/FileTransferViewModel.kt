@@ -3,8 +3,12 @@ package com.remotepad.app.ui.files
 import android.app.Application
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.remotepad.app.network.ConnectionManager
 import com.remotepad.app.network.ConnectionState
 import com.remotepad.app.network.FileTransferClient
 import com.remotepad.app.network.P2PFileClient
@@ -66,6 +70,49 @@ data class FileBrowserUiState(
     val errorMessage: String? = null,
 )
 
+data class PendingShareItem(
+    val uri: Uri,
+    val fileName: String,
+    val fileSize: Long,
+)
+
+val IMAGE_EXTENSIONS = setOf(
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "svg", "ico"
+)
+val VIDEO_EXTENSIONS = setOf(
+    "mp4", "mkv", "webm", "avi", "mov", "flv", "ts", "m4v", "3gp", "wmv"
+)
+val AUDIO_EXTENSIONS = setOf(
+    "mp3", "wav", "flac", "aac", "ogg", "m4a", "wma"
+)
+
+enum class FileCategory {
+    DIRECTORY,
+    IMAGE,
+    VIDEO,
+    AUDIO,
+    DOCUMENT,
+    OTHER,
+}
+
+fun PcFileEntry.getCategory(): FileCategory {
+    if (isDir) return FileCategory.DIRECTORY
+    val ext = name.substringAfterLast('.', "").lowercase()
+    return when (ext) {
+        in IMAGE_EXTENSIONS -> FileCategory.IMAGE
+        in VIDEO_EXTENSIONS -> FileCategory.VIDEO
+        in AUDIO_EXTENSIONS -> FileCategory.AUDIO
+        "pdf", "doc", "docx", "txt", "rtf", "md", "xls", "xlsx", "ppt", "pptx" -> FileCategory.DOCUMENT
+        else -> FileCategory.OTHER
+    }
+}
+
+data class ActiveMediaPreview(
+    val entry: PcFileEntry,
+    val streamUrl: String,
+    val category: FileCategory,
+)
+
 class FileTransferViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -78,6 +125,51 @@ class FileTransferViewModel(application: Application) : AndroidViewModel(applica
     private val _transfers = MutableStateFlow<List<TransferItem>>(emptyList())
     val transfers: StateFlow<List<TransferItem>> = _transfers.asStateFlow()
 
+    private val _activePreview = MutableStateFlow<ActiveMediaPreview?>(null)
+    val activePreview: StateFlow<ActiveMediaPreview?> = _activePreview.asStateFlow()
+
+    fun getStreamUrl(remotePath: String): String? {
+        val target = connectedTarget ?: return null
+        if (target.host.isNotBlank() && target.filePort > 0) {
+            val encoded = Uri.encode(remotePath)
+            return "http://${target.host}:${target.filePort}/api/download?path=$encoded"
+        }
+        return null
+    }
+
+    fun openPreview(entry: PcFileEntry) {
+        if (entry.isDir) return
+        val cat = entry.getCategory()
+        val streamUrl = getStreamUrl(entry.path)
+        if (streamUrl != null) {
+            _activePreview.value = ActiveMediaPreview(
+                entry = entry,
+                streamUrl = streamUrl,
+                category = cat,
+            )
+        } else {
+            postToast("Direct preview requires Local Wi-Fi connection")
+            downloadEntry(entry)
+        }
+    }
+
+    fun closePreview() {
+        _activePreview.value = null
+    }
+
+    private val _pendingShares = MutableStateFlow<List<PendingShareItem>>(emptyList())
+    val pendingShares: StateFlow<List<PendingShareItem>> = _pendingShares.asStateFlow()
+
+    private val _isConnectingForShare = MutableStateFlow(false)
+    val isConnectingForShare: StateFlow<Boolean> = _isConnectingForShare.asStateFlow()
+
+    private val _navigateToFilesEvent = MutableStateFlow(false)
+    val navigateToFilesEvent: StateFlow<Boolean> = _navigateToFilesEvent.asStateFlow()
+
+    fun onNavigatedToFiles() {
+        _navigateToFilesEvent.value = false
+    }
+
     private val activeCancelers = ConcurrentHashMap<String, () -> Unit>()
 
     @Volatile
@@ -88,37 +180,100 @@ class FileTransferViewModel(application: Application) : AndroidViewModel(applica
     private var lastLoadedEndpoint: String? = null
 
     fun syncConnection(state: ConnectionState, p2pClient: P2PUdpClient? = null) {
-        val lanAllowed = state is ConnectionState.Connected &&
-            state.transportMode == TransportMode.LAN &&
-            !state.viaRelay &&
-            state.host.isNotBlank()
-        val p2pAllowed = state is ConnectionState.Connected &&
-            state.transportMode == TransportMode.P2P_DIRECT &&
-            p2pClient != null &&
-            p2pClient.isConnected
-
-        if (lanAllowed) {
-            connectedTarget = state as ConnectionState.Connected
-            activeP2PClient = null
-            val endpoint = "lan:${state.host}:${state.filePort}"
+        if (state is ConnectionState.Connected) {
+            connectedTarget = state
+            val isDirectLan = state.transportMode == TransportMode.LAN && !state.viaRelay && state.host.isNotBlank()
+            val endpoint = if (isDirectLan) {
+                activeP2PClient = null
+                "lan:${state.host}:${state.filePort}"
+            } else {
+                activeP2PClient = p2pClient
+                "p2p:${state.target}:${state.transportMode}"
+            }
             if (lastLoadedEndpoint != endpoint) {
                 lastLoadedEndpoint = endpoint
                 loadInitial()
             }
-        } else if (p2pAllowed) {
-            connectedTarget = state as ConnectionState.Connected
-            activeP2PClient = p2pClient
-            val endpoint = "p2p:${state.target}"
-            if (lastLoadedEndpoint != endpoint) {
-                lastLoadedEndpoint = endpoint
-                loadInitial()
-            }
+            flushPendingSharesIfReady()
         } else {
-            // Disconnected, Punching, or VPS Relay -> file transfer intentionally disabled
             connectedTarget = null
             activeP2PClient = null
             lastLoadedEndpoint = null
             _browserState.value = FileBrowserUiState()
+            if (state is ConnectionState.Disconnected || state is ConnectionState.Error) {
+                _isConnectingForShare.value = false
+            }
+        }
+    }
+
+    fun onReceiveSharedUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        _navigateToFilesEvent.value = true
+
+        val items = uris.map { uri ->
+            val meta = client.queryLocalFileMeta(appContext, uri)
+            PendingShareItem(
+                uri = uri,
+                fileName = meta.displayName,
+                fileSize = meta.size,
+            )
+        }
+
+        val target = connectedTarget
+        val canTransfer = target != null && (
+            (target.transportMode == TransportMode.LAN && !target.viaRelay && target.host.isNotBlank()) ||
+                (target.transportMode == TransportMode.P2P_DIRECT && activeP2PClient?.isConnected == true)
+        )
+
+        if (canTransfer) {
+            _isConnectingForShare.value = false
+            _pendingShares.value = emptyList()
+            postToast(
+                if (items.size == 1) "Sending ${items.first().fileName} to PC..." else "Sending ${items.size} files to PC..."
+            )
+            uploadUris(uris)
+        } else {
+            _pendingShares.update { current ->
+                val existing = current.map { it.uri }.toSet()
+                current + items.filter { it.uri !in existing }
+            }
+            _isConnectingForShare.value = true
+            postToast(
+                if (items.size == 1) "Connecting to PC to send ${items.first().fileName}..." else "Connecting to PC to send ${items.size} files..."
+            )
+            ConnectionManager.getInstance(appContext).reconnectWifiFirst()
+        }
+    }
+
+    private fun flushPendingSharesIfReady() {
+        val pending = _pendingShares.value
+        if (pending.isNotEmpty() && connectedTarget != null) {
+            _pendingShares.value = emptyList()
+            _isConnectingForShare.value = false
+            postToast(
+                if (pending.size == 1) "Connected! Sending ${pending.first().fileName}..." else "Connected! Sending ${pending.size} files..."
+            )
+            uploadUris(pending.map { it.uri })
+        }
+    }
+
+    fun retryConnectingForShare() {
+        if (_pendingShares.value.isNotEmpty()) {
+            _isConnectingForShare.value = true
+            postToast("Reconnecting to PC...")
+            ConnectionManager.getInstance(appContext).reconnectWifiFirst()
+        }
+    }
+
+    fun cancelPendingShares() {
+        _pendingShares.value = emptyList()
+        _isConnectingForShare.value = false
+        postToast("File send cancelled")
+    }
+
+    private fun postToast(msg: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, msg, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -363,6 +518,7 @@ class FileTransferViewModel(application: Application) : AndroidViewModel(applica
                             detail = "Saved on PC",
                         )
                     }
+                    postToast("Sent to PC: ${result.savedName}")
                 }.onFailure { err ->
                     val cancelled = cancelToken.get() || activeCall?.isCanceled() == true
                     updateTransfer(id) { item ->
@@ -370,6 +526,9 @@ class FileTransferViewModel(application: Application) : AndroidViewModel(applica
                             status = if (cancelled) TransferStatus.CANCELLED else TransferStatus.FAILED,
                             detail = if (cancelled) "Cancelled" else (err.message ?: "Upload failed"),
                         )
+                    }
+                    if (!cancelled) {
+                        postToast("Failed to send ${meta.displayName}: ${err.message ?: "Unknown error"}")
                     }
                 }
                 activeCancelers.remove(id)

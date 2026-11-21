@@ -122,7 +122,7 @@ class P2PFileClient(
         output: OutputStream,
         onProgress: (transferred: Long, total: Long) -> Unit,
     ): Long {
-        val authTag = p2p.currentAuthTag() ?: throw IOException("Direct P2P is not connected")
+        val authTag = p2p.currentAuthTag() ?: p2p.ensureAuthTag()
         val xferId = p2p.allocateTransferId()
         val rxQueue = LinkedBlockingQueue<UnpackedFilePacket>()
         p2p.registerFileListener(xferId) { pkt -> rxQueue.offer(pkt) }
@@ -158,7 +158,7 @@ class P2PFileClient(
 
             // Send initial request immediately
             if (!p2p.sendRawFilePacket(reqPacket)) {
-                throw IOException("Direct P2P is not connected")
+                throw IOException("Cannot send file request to PC")
             }
             lastReqSendMs = SystemClock.elapsedRealtime()
 
@@ -167,8 +167,8 @@ class P2PFileClient(
                     p2p.sendRawFilePacket(P2PWire.packFileAbort(authTag, xferId, "Cancelled"))
                     throw IOException("Cancelled")
                 }
-                if (!p2p.isConnected) {
-                    throw IOException("Direct P2P disconnected")
+                if (!p2p.canSendFilePackets) {
+                    throw IOException("File transfer connection lost")
                 }
 
                 val now = SystemClock.elapsedRealtime()
@@ -291,7 +291,7 @@ class P2PFileClient(
         input: InputStream,
         onProgress: (transferred: Long, total: Long) -> Unit,
     ): UploadedFileResult {
-        val authTag = p2p.currentAuthTag() ?: throw IOException("Direct P2P is not connected")
+        val authTag = p2p.currentAuthTag() ?: p2p.ensureAuthTag()
         val xferId = p2p.allocateTransferId()
         val rxQueue = LinkedBlockingQueue<UnpackedFilePacket>()
         p2p.registerFileListener(xferId) { pkt -> rxQueue.offer(pkt) }
@@ -316,7 +316,7 @@ class P2PFileClient(
                     p2p.sendRawFilePacket(P2PWire.packFileAbort(authTag, xferId, "Cancelled"))
                     throw IOException("Cancelled")
                 }
-                if (!p2p.isConnected) throw IOException("Direct P2P disconnected")
+                if (!p2p.canSendFilePackets) throw IOException("File transfer connection lost")
                 val now = SystemClock.elapsedRealtime()
                 if (now - handshakeStart > REQ_TIMEOUT_MS) {
                     throw IOException("PC did not respond to upload request")
@@ -363,7 +363,7 @@ class P2PFileClient(
                     p2p.sendRawFilePacket(P2PWire.packFileAbort(authTag, xferId, "Cancelled"))
                     throw IOException("Cancelled")
                 }
-                if (!p2p.isConnected) throw IOException("Direct P2P disconnected")
+                if (!p2p.canSendFilePackets) throw IOException("File transfer connection lost")
 
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastAckMs > STALL_TIMEOUT_MS) {

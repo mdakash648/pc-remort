@@ -13,6 +13,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from config import AgentConfig
+from core.device_manager import DeviceManager
+from core.p2p_file import P2PFileHandler
 from core.relay_client import RelayClient
 from core.server import LocalWebSocketServer, get_local_ipv4_addresses
 from features.discovery import LanDiscoveryService
@@ -79,6 +81,9 @@ class AgentStatus:
     lan_clients_count: int
     mic_status: str
     received_files_dir: str
+    connected_devices: tuple[dict[str, Any], ...] = ()
+    connected_devices_count: int = 0
+    blocked_devices: tuple[dict[str, str], ...] = ()
 
 
 class AgentRuntime:
@@ -95,11 +100,51 @@ class AgentRuntime:
         self._startup_error: BaseException | None = None
         self._running = False
 
+        self._device_manager = DeviceManager(self.config)
+        self._device_manager.set_broadcast_fn(self._broadcast_devices_update)
+
         self._server: LocalWebSocketServer | None = None
         self._file_server: FileTransferServer | None = None
         self._mic_server: MicReceiverService | None = None
         self._discovery: LanDiscoveryService | None = None
         self._relay_client: RelayClient | None = None
+
+    def _broadcast_devices_update(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            server = self._server
+        if server is not None:
+            server.broadcast_json(payload)
+
+    @property
+    def device_manager(self) -> DeviceManager:
+        return self._device_manager
+
+    def disconnect_device(self, device_id: str) -> bool:
+        return self._device_manager.disconnect_device(device_id)
+
+    def block_device(self, device_id: str) -> bool:
+        res = self._device_manager.block_device(device_id)
+        if res and self._config_path:
+            try:
+                self.config.save(self._config_path)
+            except Exception:
+                pass
+        return res
+
+    def unblock_device(self, identifier: str) -> bool:
+        res = self._device_manager.unblock_device(identifier)
+        if res:
+            if self._config_path:
+                try:
+                    self.config.save(self._config_path)
+                except Exception:
+                    pass
+            with self._lock:
+                relay = self._relay_client
+                loop = self._loop
+            if relay is not None and loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(relay._send_unblock_device(identifier), loop)
+        return res
 
     @property
     def is_running(self) -> bool:
@@ -202,6 +247,10 @@ class AgentRuntime:
             relay_state = "disabled"
             relay_peer_online = False
             relay_last_error = None
+        elif not cfg.relay_device_id.strip() or not cfg.relay_token.strip():
+            relay_state = "unconfigured"
+            relay_peer_online = False
+            relay_last_error = "PC ID or Token not set"
         elif relay is None:
             relay_state = "connecting"
             relay_peer_online = False
@@ -230,6 +279,19 @@ class AgentRuntime:
 
         received_dir = str(file_srv.received_dir) if file_srv is not None else ""
 
+        connected_devs = tuple(
+            {
+                "id": d.id,
+                "name": d.name,
+                "transport": d.transport,
+                "ip": d.ip,
+                "uptime_s": d.uptime_seconds,
+                "is_relay": d.is_relay,
+            }
+            for d in self._device_manager.get_devices()
+        )
+        blocked_devs = tuple(self.config.blocked_devices)
+
         return AgentStatus(
             running=running,
             pc_name=pc_name,
@@ -245,6 +307,9 @@ class AgentRuntime:
             lan_clients_count=lan_clients,
             mic_status=mic_status,
             received_files_dir=received_dir,
+            connected_devices=connected_devs,
+            connected_devices_count=len(connected_devs),
+            blocked_devices=blocked_devs,
         )
 
     def _thread_main(self) -> None:
@@ -304,6 +369,8 @@ class AgentRuntime:
             )
             await file_server.start()
 
+        file_handler = P2PFileHandler(file_server) if file_server is not None else None
+
         mic_server: MicReceiverService | None = None
         if cfg.mic_enabled:
             mic_server = MicReceiverService(
@@ -321,6 +388,9 @@ class AgentRuntime:
             file_port=file_server.port if file_server is not None else None,
             mic_port=mic_server.port if mic_server is not None else None,
             mic_device_provider=mic_server.refresh_device if mic_server is not None else None,
+            device_manager=self._device_manager,
+            file_handler=file_handler,
+            mic_server=mic_server,
         )
         await server.start()
 
@@ -356,7 +426,12 @@ class AgentRuntime:
         if server is None:
             return
 
-        if cfg.relay_enabled and cfg.relay_url.strip():
+        if (
+            cfg.relay_enabled
+            and cfg.relay_url.strip()
+            and cfg.relay_device_id.strip()
+            and cfg.relay_token.strip()
+        ):
             new_relay = RelayClient(
                 server=server,
                 relay_url=cfg.relay_url,
@@ -365,6 +440,8 @@ class AgentRuntime:
                 p2p_enabled=cfg.relay_p2p_enabled,
                 relay_udp_port=cfg.relay_udp_port,
                 file_server=file_server,
+                device_manager=self._device_manager,
+                mic_server=self._mic_server,
             )
             await new_relay.start()
             with self._lock:
@@ -375,7 +452,10 @@ class AgentRuntime:
                 cfg.relay_device_id,
             )
         else:
-            logger.info("Relay client disabled")
+            if not cfg.relay_enabled:
+                logger.info("Relay client disabled")
+            else:
+                logger.info("Relay client waiting for PC ID and token to be configured")
 
     async def _stop_services(self) -> None:
         with self._lock:

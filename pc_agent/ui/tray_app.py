@@ -134,6 +134,12 @@ class RemotePadTrayApp:
         self._token_entry: tk.Entry
         self._toggle_token_btn: tk.Button
         self._save_btn: tk.Button
+        self._devices_badge_lbl: tk.Label
+        self._devices_container: tk.Frame
+        self._blocked_container: tk.Frame
+        self._last_devices_snapshot: tuple[dict[str, Any], ...] | None = None
+        self._last_blocked_snapshot: tuple[dict[str, str], ...] | None = None
+        self._last_connected_count: int = -1
         self._last_lan_url: str = ""
         self._last_tooltip: str = ""
         self._last_tray_status_line: str = ""
@@ -409,7 +415,44 @@ class RemotePadTrayApp:
         reconnect_btn.pack(side="left", padx=(8, 0))
         self._bind_hover(reconnect_btn, _BTN_SECONDARY, _BTN_SECONDARY_HOVER)
 
-        # --- Card 2: Local Network & Startup ---
+        # --- Card 2: Remote Connected Devices ---
+        devices_card = tk.Frame(
+            outer,
+            bg=_BG_CARD,
+            highlightbackground=_BORDER,
+            highlightthickness=1,
+            padx=16,
+            pady=12,
+        )
+        devices_card.pack(fill="x", pady=(0, 12))
+
+        dev_hdr = tk.Frame(devices_card, bg=_BG_CARD)
+        dev_hdr.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            dev_hdr,
+            text="Remote Connected Devices",
+            bg=_BG_CARD,
+            fg=_TEXT_PRIMARY,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+
+        self._devices_badge_lbl = tk.Label(
+            dev_hdr,
+            text="0 Connected",
+            bg=_BG_CARD,
+            fg=_TEXT_MUTED,
+            font=("Segoe UI", 9, "bold"),
+        )
+        self._devices_badge_lbl.pack(side="right")
+
+        self._devices_container = tk.Frame(devices_card, bg=_BG_CARD)
+        self._devices_container.pack(fill="x", pady=(0, 4))
+
+        self._blocked_container = tk.Frame(devices_card, bg=_BG_CARD)
+        self._blocked_container.pack(fill="x")
+
+        # --- Card 3: Local Network & Startup ---
         info_card = tk.Frame(
             outer,
             bg=_BG_CARD,
@@ -656,6 +699,148 @@ class RemotePadTrayApp:
         self._bind_hover(btn, _BTN_SECONDARY, _BTN_SECONDARY_HOVER)
         return btn
 
+    def _make_danger_button(self, parent: tk.Widget, text: str, command: Any) -> tk.Button:
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=_DANGER,
+            fg="#FFFFFF",
+            activebackground=_DANGER_HOVER,
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=4,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self._bind_hover(btn, _DANGER, _DANGER_HOVER)
+        return btn
+
+    def _on_disconnect_device(self, device_id: str) -> None:
+        def _worker() -> None:
+            self.runtime.disconnect_device(device_id)
+            self._post_to_ui(self._poll_status)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_block_device(self, device_id: str) -> None:
+        def _worker() -> None:
+            self.runtime.block_device(device_id)
+            self._post_to_ui(self._poll_status)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_unblock_device(self, identifier: str) -> None:
+        def _worker() -> None:
+            self.runtime.unblock_device(identifier)
+            self._post_to_ui(self._poll_status)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _rebuild_devices_ui(
+        self,
+        devs: tuple[dict[str, Any], ...],
+        blocked: tuple[dict[str, str], ...],
+    ) -> None:
+        for w in self._devices_container.winfo_children():
+            w.destroy()
+        for w in self._blocked_container.winfo_children():
+            w.destroy()
+
+        if not devs:
+            tk.Label(
+                self._devices_container,
+                text="No remote devices currently connected.",
+                bg=_BG_CARD,
+                fg=_TEXT_MUTED,
+                font=("Segoe UI", 9),
+            ).pack(anchor="w", pady=(2, 4))
+        else:
+            for d in devs:
+                dev_id = d["id"]
+                row = tk.Frame(
+                    self._devices_container,
+                    bg=_BG_INPUT,
+                    highlightbackground=_BORDER,
+                    highlightthickness=1,
+                    padx=10,
+                    pady=6,
+                )
+                row.pack(fill="x", pady=(0, 6))
+
+                info_col = tk.Frame(row, bg=_BG_INPUT)
+                info_col.pack(side="left", fill="x", expand=True)
+
+                name_row = tk.Frame(info_col, bg=_BG_INPUT)
+                name_row.pack(anchor="w")
+
+                tk.Label(
+                    name_row,
+                    text="●",
+                    bg=_BG_INPUT,
+                    fg=_SUCCESS,
+                    font=("Segoe UI", 8),
+                ).pack(side="left", padx=(0, 6))
+
+                tk.Label(
+                    name_row,
+                    text=d.get("name", "Unknown Phone"),
+                    bg=_BG_INPUT,
+                    fg=_TEXT_PRIMARY,
+                    font=("Segoe UI", 9, "bold"),
+                ).pack(side="left")
+
+                sub_text = f"{d.get('transport', 'Remote')}  •  IP: {d.get('ip') or 'N/A'}"
+                tk.Label(
+                    info_col,
+                    text=sub_text,
+                    bg=_BG_INPUT,
+                    fg=_TEXT_SECONDARY,
+                    font=("Segoe UI", 8),
+                ).pack(anchor="w", padx=(14, 0))
+
+                btn_col = tk.Frame(row, bg=_BG_INPUT)
+                btn_col.pack(side="right")
+
+                self._make_danger_button(
+                    btn_col,
+                    "Disconnect",
+                    lambda did=dev_id: self._on_disconnect_device(did),
+                ).pack(side="left", padx=(0, 6))
+
+                self._make_danger_button(
+                    btn_col,
+                    "Block",
+                    lambda did=dev_id: self._on_block_device(did),
+                ).pack(side="left")
+
+        if blocked:
+            tk.Frame(self._blocked_container, bg=_BORDER, height=1).pack(fill="x", pady=(6, 6))
+            tk.Label(
+                self._blocked_container,
+                text=f"Blocked Devices ({len(blocked)}):",
+                bg=_BG_CARD,
+                fg=_WARN,
+                font=("Segoe UI", 8, "bold"),
+            ).pack(anchor="w", pady=(0, 4))
+
+            for b in blocked:
+                b_ident = b.get("id") or b.get("name") or b.get("ip") or "Device"
+                b_row = tk.Frame(self._blocked_container, bg=_BG_CARD)
+                b_row.pack(fill="x", pady=(0, 3))
+                tk.Label(
+                    b_row,
+                    text=f"🚫 {b.get('name') or b_ident} ({b.get('ip') or 'blocked'})",
+                    bg=_BG_CARD,
+                    fg=_TEXT_MUTED,
+                    font=("Segoe UI", 8),
+                ).pack(side="left")
+
+                self._make_small_button(
+                    b_row,
+                    "Unblock",
+                    lambda ident=b_ident: self._on_unblock_device(ident),
+                ).pack(side="right")
+
     @staticmethod
     def _bind_hover(widget: tk.Button, normal_bg: str, hover_bg: str) -> None:
         widget.bind("<Enter>", lambda _e: widget.configure(bg=hover_bg))
@@ -664,6 +849,33 @@ class RemotePadTrayApp:
     # ------------------------------------------------------------------
     # System tray integration (pystray)
     # ------------------------------------------------------------------
+
+    def _devices_menu(self) -> list[Any]:
+        status = self.runtime.get_status()
+        devs = status.connected_devices
+        if not devs:
+            return [pystray.MenuItem("No devices connected", lambda _icon, _item: None, enabled=False)]
+        items: list[Any] = []
+        for d in devs:
+            dev_id = str(d["id"])
+            dev_name = str(d["name"])
+            transport = str(d["transport"])
+
+            def _make_disconnect(target_id: str) -> Callable[[Any, Any], None]:
+                return lambda _icon, _item: self._on_disconnect_device(target_id)
+
+            def _make_block(target_id: str) -> Callable[[Any, Any], None]:
+                return lambda _icon, _item: self._on_block_device(target_id)
+
+            dev_sub = pystray.Menu(
+                pystray.MenuItem(f"Type: {transport}", lambda _icon, _item: None, enabled=False),
+                pystray.MenuItem(f"IP: {d.get('ip') or 'N/A'}", lambda _icon, _item: None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Disconnect", _make_disconnect(dev_id)),
+                pystray.MenuItem("Block Device", _make_block(dev_id)),
+            )
+            items.append(pystray.MenuItem(f"{dev_name} ({transport})", dev_sub))
+        return items
 
     def _start_tray_icon(self) -> None:
         items: list[Any] = [
@@ -676,6 +888,10 @@ class RemotePadTrayApp:
                 lambda _item: self._tray_status_text(),
                 lambda _icon, _item: None,
                 enabled=False,
+            ),
+            pystray.MenuItem(
+                lambda _item: f"Connected Devices ({self.runtime.get_status().connected_devices_count})",
+                pystray.Menu(lambda: self._devices_menu()),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Reconnect Relay", self._tray_on_reconnect),
@@ -709,11 +925,14 @@ class RemotePadTrayApp:
 
     def _tray_status_text(self) -> str:
         status = self.runtime.get_status()
+        if status.relay_state == "unconfigured":
+            return "Relay: PC ID & Token not set"
         if status.relay_state == "p2p_active":
             return f"Relay: Direct P2P ({status.relay_device_id})"
         if status.relay_state == "connected":
             suffix = " • Phone Online" if status.relay_peer_online else ""
-            return f"Relay: Connected ({status.relay_device_id}){suffix}"
+            dev_label = f" ({status.relay_device_id})" if status.relay_device_id else ""
+            return f"Relay: Connected{dev_label}{suffix}"
         if status.relay_state == "disabled":
             return "Relay: Disabled (LAN only)"
         if status.relay_state == "error":
@@ -964,6 +1183,20 @@ class RemotePadTrayApp:
         self._status_dot.configure(fg=dot_color)
         self._status_label.configure(text=text)
 
+        # Update devices card
+        curr_devs = status.connected_devices
+        curr_blocked = status.blocked_devices
+        count = status.connected_devices_count
+        self._devices_badge_lbl.configure(
+            text=f"{count} Connected" if count > 0 else "0 Connected",
+            fg=_SUCCESS if count > 0 else _TEXT_MUTED,
+        )
+
+        if curr_devs != self._last_devices_snapshot or curr_blocked != self._last_blocked_snapshot:
+            self._last_devices_snapshot = curr_devs
+            self._last_blocked_snapshot = curr_blocked
+            self._rebuild_devices_ui(curr_devs, curr_blocked)
+
         primary_ip = status.local_ips[0] if status.local_ips else "127.0.0.1"
         self._last_lan_url = f"ws://{primary_ip}:{status.ws_port}"
         lan_extra = f"  ({status.lan_clients_count} phone)" if status.lan_clients_count else ""
@@ -982,16 +1215,24 @@ class RemotePadTrayApp:
         icon = self._tray_icon
         if icon is None:
             return
-        if status.relay_state == "p2p_active":
+        if status.relay_state == "unconfigured":
+            tooltip = f"RemotePad — PC ID & Token not set ({status.pc_name})"
+        elif status.relay_state == "p2p_active":
             tooltip = f"RemotePad — Direct P2P ({status.relay_device_id})"
         elif status.relay_state == "connected":
-            tooltip = f"RemotePad — Connected ({status.relay_device_id})"
+            dev_label = f" ({status.relay_device_id})" if status.relay_device_id else ""
+            tooltip = f"RemotePad — Connected{dev_label}"
         elif status.relay_state == "disabled":
             tooltip = f"RemotePad — LAN Only ({status.pc_name})"
         elif status.relay_state == "error":
-            tooltip = f"RemotePad — Reconnecting ({status.relay_device_id})"
+            dev_label = f" ({status.relay_device_id})" if status.relay_device_id else ""
+            tooltip = f"RemotePad — Reconnecting{dev_label}"
         else:
-            tooltip = f"RemotePad — Connecting ({status.relay_device_id})"
+            dev_label = f" ({status.relay_device_id})" if status.relay_device_id else ""
+            tooltip = f"RemotePad — Connecting{dev_label}"
+
+        if status.connected_devices_count > 0:
+            tooltip += f" • {status.connected_devices_count} Device(s)"
 
         # Windows tray tooltips max 127 chars
         tooltip = tooltip[:120]
@@ -1003,7 +1244,16 @@ class RemotePadTrayApp:
                 pass
 
         tray_status_line = self._tray_status_text()
-        if tray_status_line != self._last_tray_status_line:
+        if (
+            tray_status_line != self._last_tray_status_line
+            or status.connected_devices_count != self._last_connected_count
+        ):
+            self._last_tray_status_line = tray_status_line
+            self._last_connected_count = status.connected_devices_count
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
             self._last_tray_status_line = tray_status_line
             try:
                 icon.update_menu()

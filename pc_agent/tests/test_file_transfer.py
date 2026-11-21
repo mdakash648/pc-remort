@@ -119,5 +119,33 @@ async def _run_file_transfer_flow(tmp_path: Path) -> None:
 
         downloaded = await loop.run_in_executor(None, download_bytes)
         assert downloaded == payload
+
+        # 6. GET /api/download with Range (for streaming video & direct image partial loading)
+        def range_download() -> tuple[int, str | None, str | None, bytes]:
+            req = urllib.request.Request(dl_url, headers={"Range": "bytes=10-49"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = resp.status
+                accept_ranges = resp.headers.get("Accept-Ranges")
+                content_range = resp.headers.get("Content-Range")
+                body = resp.read()
+                return status, accept_ranges, content_range, body
+
+        r_status, r_accept, r_content_range, r_body = await loop.run_in_executor(None, range_download)
+        assert r_status == 206
+        assert r_body == payload[10:50]
+        assert r_accept == "bytes"
+        assert r_content_range == f"bytes 10-49/{len(payload)}"
+
+        # 7. HEAD /api/download
+        def head_download() -> tuple[int, int, bytes]:
+            req = urllib.request.Request(dl_url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                cl = int(resp.headers.get("Content-Length", 0))
+                return resp.status, cl, resp.read()
+
+        h_status, h_cl, h_body = await loop.run_in_executor(None, head_download)
+        assert h_status == 200
+        assert h_cl == len(payload)
+        assert len(h_body) == 0
     finally:
         await server.stop()

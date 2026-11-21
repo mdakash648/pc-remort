@@ -2,8 +2,10 @@ package com.remotepad.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
@@ -78,6 +80,7 @@ private enum class AppPage {
 
 class MainActivity : ComponentActivity() {
     private val touchpadVm: TouchpadViewModel by viewModels()
+    private val fileVm: FileTransferViewModel by viewModels()
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -101,12 +104,73 @@ class MainActivity : ComponentActivity() {
         }
 
         touchpadVm.onAppOpened(isFreshLaunch = savedInstanceState == null)
+        handleShareIntent(intent)
 
         setContent {
             RemotePadTheme {
-                RemotePadApp(touchpadVm = touchpadVm)
+                RemotePadApp(touchpadVm = touchpadVm, fileVm = fileVm)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        if (intent.getBooleanExtra(EXTRA_SHARE_PROCESSED, false)) return
+        intent.putExtra(EXTRA_SHARE_PROCESSED, true)
+
+        val uris = extractUrisFromIntent(intent)
+        if (uris.isNotEmpty()) {
+            fileVm.onReceiveSharedUris(uris)
+        }
+    }
+
+    private fun extractUrisFromIntent(intent: Intent): List<Uri> {
+        val results = mutableListOf<Uri>()
+        when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val streamUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+                if (streamUri != null) results.add(streamUri)
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val streamUris: ArrayList<Uri>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                }
+                if (streamUris != null) results.addAll(streamUris.filterNotNull())
+            }
+        }
+
+        val clipData = intent.clipData
+        if (clipData != null) {
+            for (i in 0 until clipData.itemCount) {
+                val itemUri = clipData.getItemAt(i)?.uri
+                if (itemUri != null && !results.contains(itemUri)) {
+                    results.add(itemUri)
+                }
+            }
+        }
+
+        if (results.isEmpty() && intent.data != null) {
+            intent.data?.let { results.add(it) }
+        }
+
+        return results.distinct()
     }
 
     /**
@@ -124,11 +188,17 @@ class MainActivity : ComponentActivity() {
         }
         return super.dispatchKeyEvent(event)
     }
+
+    companion object {
+        private const val EXTRA_SHARE_PROCESSED = "com.remotepad.app.SHARE_PROCESSED"
+    }
 }
 
 @Composable
-private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
-    val fileVm: FileTransferViewModel = viewModel()
+private fun RemotePadApp(
+    touchpadVm: TouchpadViewModel,
+    fileVm: FileTransferViewModel,
+) {
     val screenVm: RemoteScreenViewModel = viewModel()
 
     val connectionState by touchpadVm.connectionState.collectAsStateWithLifecycle()
@@ -142,6 +212,23 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
     var currentPage by rememberSaveable { mutableStateOf(AppPage.TOUCHPAD) }
     var screenLandscape by rememberSaveable { mutableStateOf(false) }
     var screenFullscreen by rememberSaveable { mutableStateOf(false) }
+
+    val navigateToFiles by fileVm.navigateToFilesEvent.collectAsStateWithLifecycle()
+    LaunchedEffect(navigateToFiles) {
+        if (navigateToFiles) {
+            if (currentPage != AppPage.FILES) {
+                if (currentPage == AppPage.TOUCHPAD) {
+                    touchpadVm.setKeyboardOpen(false)
+                }
+                if (currentPage == AppPage.SCREEN) {
+                    screenLandscape = false
+                    screenFullscreen = false
+                }
+                currentPage = AppPage.FILES
+            }
+            fileVm.onNavigatedToFiles()
+        }
+    }
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -258,18 +345,16 @@ private fun RemotePadApp(touchpadVm: TouchpadViewModel) {
                     }
                 }
 
-                // Sleek Bottom Navigation Bar (hidden while typing on Touchpad or in Fullscreen/Landscape Screen)
-                val showBottomBar = !effectiveFullscreen && !(currentPage == AppPage.TOUCHPAD && isKeyboardOpen)
+                // Sleek Bottom Navigation Bar (hidden while typing or in Fullscreen/Landscape Screen)
+                val showBottomBar = !effectiveFullscreen && !isKeyboardOpen
                 if (showBottomBar) {
                     BottomNavBar(
                         currentPage = currentPage,
                         activeTransfers = activeTransfers,
                         onSelectPage = { page ->
                             if (page != currentPage) {
-                                if (page != AppPage.TOUCHPAD) {
-                                    touchpadVm.setKeyboardOpen(false)
-                                    keyboardController?.hide()
-                                }
+                                touchpadVm.setKeyboardOpen(false)
+                                keyboardController?.hide()
                                 if (page != AppPage.SCREEN) {
                                     screenLandscape = false
                                     screenFullscreen = false
