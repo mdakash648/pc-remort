@@ -145,13 +145,21 @@ private fun clampPan(
     if (zoom <= 1.001f) return Offset.Zero
     val scaledW = fit.width * zoom
     val scaledH = fit.height * zoom
-    val maxPanX = ((scaledW - canvasW) * 0.5f).coerceAtLeast(0f) + fit.left * (zoom - 1f) * 0f
-    val maxPanY = ((scaledH - canvasH) * 0.5f).coerceAtLeast(0f)
-    // Allow panning across the full zoomed content area cleanly
-    val limitX = ((scaledW - canvasW) * 0.5f).coerceAtLeast(0f)
-    val limitY = ((scaledH - canvasH) * 0.5f).coerceAtLeast(0f)
+
+    val limitX = if (scaledW >= canvasW) {
+        (scaledW - canvasW) * 0.5f
+    } else {
+        ((canvasW - scaledW) * 0.5f) * ((zoom - 1f) / 0.5f).coerceIn(0f, 1f)
+    }
+
+    val limitY = if (scaledH >= canvasH) {
+        (scaledH - canvasH) * 0.5f
+    } else {
+        ((canvasH - scaledH) * 0.5f) * ((zoom - 1f) / 0.5f).coerceIn(0f, 1f)
+    }
+
     return Offset(
-        x = pan.x.coerceIn(-limitX.coerceAtLeast(maxPanX), limitX.coerceAtLeast(maxPanX)),
+        x = pan.x.coerceIn(-limitX, limitX),
         y = pan.y.coerceIn(-limitY, limitY),
     )
 }
@@ -352,6 +360,8 @@ fun RemoteScreenView(
                 }
             }
         }
+
+
 
         val tapSlopPx = with(density) { 10.dp.toPx() }
         var lastTapTimeMs by remember { mutableLongStateOf(0L) }
@@ -711,12 +721,20 @@ fun RemoteScreenView(
                                         val ch = latestContainerH
                                         val fit = computeFitRect(cw, ch, st.frameWidth, st.frameHeight)
                                         val newZoom = (latestZoom * zoomChange).coerceIn(1f, 4f)
-                                        val newPan = if (newZoom <= 1.01f) {
+                                        val newPan = if (newZoom <= 1.005f) {
                                             Offset.Zero
                                         } else {
-                                            clampPan(latestPan + panChange, newZoom, cw, ch, fit)
+                                            val s = newZoom / latestZoom
+                                            val focalPoint = if (centroid != Offset.Unspecified) centroid else prevCentroid
+                                            val focalPan = if (focalPoint != Offset.Unspecified) {
+                                                val center = Offset(cw * 0.5f, ch * 0.5f)
+                                                latestPan + panChange + (focalPoint - center - latestPan) * (1f - s)
+                                            } else {
+                                                latestPan + panChange
+                                            }
+                                            clampPan(focalPan, newZoom, cw, ch, fit)
                                         }
-                                        zoom = newZoom
+                                        zoom = if (newZoom <= 1.005f) 1f else newZoom
                                         pan = newPan
                                     }
                                     active.forEach { it.consume() }
@@ -746,7 +764,9 @@ fun RemoteScreenView(
             val bitmap = uiState.frameBitmap
             if (bitmap != null && isConnected) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    val fit = computeFitRect(size.width, size.height, bitmap.width, bitmap.height)
+                    val baseW = if (uiState.frameWidth > 0) uiState.frameWidth else bitmap.width
+                    val baseH = if (uiState.frameHeight > 0) uiState.frameHeight else bitmap.height
+                    val fit = computeFitRect(size.width, size.height, baseW, baseH)
                     val cx = size.width * 0.5f
                     val cy = size.height * 0.5f
 
@@ -759,7 +779,7 @@ fun RemoteScreenView(
                         image = bitmap,
                         dstOffset = IntOffset(dstLeft.roundToInt(), dstTop.roundToInt()),
                         dstSize = IntSize(dstW.roundToInt().coerceAtLeast(1), dstH.roundToInt().coerceAtLeast(1)),
-                        filterQuality = FilterQuality.Low,
+                        filterQuality = FilterQuality.Medium,
                     )
 
                     // Subtle neon border around PC frame so edges are crisp on black letterbox
@@ -971,7 +991,7 @@ fun RemoteScreenView(
         }
 
         // 2.5. Idea 2: Right-Edge Translucent 1-Finger Scroll Strip (dedicated thumb scroll bar)
-        if (showScrollStrip && isConnected && !showKeyboard) {
+        if (showScrollStrip && isConnected) {
             EdgeScrollStrip(
                 onScrollDelta = { dyPx ->
                     if (useLocalCursor) {
@@ -983,7 +1003,7 @@ fun RemoteScreenView(
                     .align(Alignment.CenterEnd)
                     .padding(end = 6.dp)
                     .width(28.dp)
-                    .fillMaxHeight(0.46f),
+                    .fillMaxHeight(if (showKeyboard) 0.62f else 0.46f),
             )
         }
 

@@ -470,3 +470,52 @@ def test_hide_cursor_protocol_and_dirty_check_skips_cursor_only_moves() -> None:
     moved_lan = streamer._capture_and_encode_sync(0, 960, 50, 2, force_send=False, draw_cursor=True)
     assert moved_lan is not None
 
+
+def test_rscr_roi_pack_unpack_roundtrip() -> None:
+    payload = b"\xff\xd8\xff\xe0dummy-roi-bytes\xff\xd9"
+    roi = (0.2, 0.3, 0.4, 0.5)
+    wire = pack_screen_frame(
+        seq=999,
+        monitor_index=0,
+        monitor_count=1,
+        width=640,
+        height=360,
+        cursor_x=32000,
+        cursor_y=16000,
+        has_cursor=True,
+        payload=payload,
+        roi=roi,
+    )
+    assert len(wire) == 28 + len(payload)
+    unpacked = unpack_screen_frame(wire)
+    assert unpacked is not None
+    assert unpacked.has_roi is True
+    assert unpacked.roi is not None
+    rx, ry, rw, rh = unpacked.roi
+    assert abs(rx - 0.2) < 0.001
+    assert abs(ry - 0.3) < 0.001
+    assert abs(rw - 0.4) < 0.001
+    assert abs(rh - 0.5) < 0.001
+    assert unpacked.payload == payload
+
+
+def test_text_clarity_quality_profile_and_subsampling() -> None:
+    from features.screen_capture import resolve_jpeg_subsampling, resolve_max_frame_bytes
+
+    w_lan, q_lan, fps_lan = resolve_quality_profile("text", "lan", 30, 1920)
+    assert w_lan == 1920 and q_lan >= 86
+    assert resolve_jpeg_subsampling("text", "lan") == 0  # 4:4:4
+
+    w_p2p, q_p2p, fps_p2p = resolve_quality_profile("text", "p2p", 30, 1920)
+    assert w_p2p == 1920 and q_p2p >= 80
+    assert resolve_jpeg_subsampling("text", "p2p") == 0  # 4:4:4 for pin-sharp text!
+
+    w_vps, q_vps, fps_vps = resolve_quality_profile("text", "vps", 30, 1920)
+    assert w_vps == 1920 and q_vps >= 78
+    assert resolve_jpeg_subsampling("text", "vps") == 0  # 4:4:4 for VPS too!
+
+    # Bounded byte budgets
+    assert resolve_max_frame_bytes("text", "p2p", is_roi=True) == 65 * 1024
+    assert resolve_max_frame_bytes("text", "p2p", is_roi=False) == 140 * 1024
+
+

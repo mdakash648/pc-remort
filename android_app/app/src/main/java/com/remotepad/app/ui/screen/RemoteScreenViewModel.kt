@@ -30,7 +30,8 @@ enum class ScreenQuality(
     val maxWidth: Int,
     val fps: Int,
 ) {
-    AUTO("Auto", "auto", 1920, 30),
+    AUTO("Auto", "auto", 1920, 24),
+    TEXT("Text Clarity (1080p)", "text", 1920, 16),
     HD("HD", "hd", 1920, 30),
     BALANCED("Balanced", "balanced", 1440, 24),
     FAST("Fast", "fast", 960, 30),
@@ -56,6 +57,7 @@ data class RemoteScreenUiState(
     val quality: ScreenQuality = ScreenQuality.AUTO,
     val inputMode: ScreenInputMode = ScreenInputMode.TOUCHPAD,
     val isStreaming: Boolean = false,
+    val roiNorm: FloatArray? = null,
 )
 
 class RemoteScreenViewModel(application: Application) : AndroidViewModel(application) {
@@ -86,11 +88,18 @@ class RemoteScreenViewModel(application: Application) : AndroidViewModel(applica
     @Volatile
     private var lastLocalCursorSyncMs = 0L
 
+    @Volatile
+    private var currentRoi: List<Float>? = null
+
     private var watchdogJob: Job? = null
 
     init {
         observeConnection()
         observeFrames()
+    }
+
+    fun updateRoi(roi: List<Float>?) {
+        // No-op: Full desktop is always streamed just like AnyDesk (client-side viewport zoom & pan)
     }
 
     fun setScreenVisible(visible: Boolean) {
@@ -178,6 +187,7 @@ class RemoteScreenViewModel(application: Application) : AndroidViewModel(applica
                 monitor = st.monitorIndex,
                 preferP2p = preferP2p,
                 hideCursor = connected.viaRelay,
+                roi = null,
             )
         )
         startP2pWatchdog()
@@ -299,6 +309,7 @@ class RemoteScreenViewModel(application: Application) : AndroidViewModel(applica
                         receivingViaP2p = packet.fromP2p,
                         p2pFallbackActive = if (packet.fromP2p) false else current.p2pFallbackActive,
                         isStreaming = streamStartedOnServer,
+                        roiNorm = null,
                     )
                 }
             }
@@ -324,6 +335,7 @@ class RemoteScreenViewModel(application: Application) : AndroidViewModel(applica
                         monitor = st.monitorIndex,
                         preferP2p = preferP2p,
                         hideCursor = connected.viaRelay,
+                        roi = null,
                     )
                 )
                 _uiState.update { it.copy(isStreaming = true, p2pFallbackActive = false) }

@@ -408,6 +408,7 @@ class LocalWebSocketServer:
             monitor=msg.monitor,
             prefer_p2p=msg.prefer_p2p,
             hide_cursor=msg.hide_cursor,
+            roi=msg.roi,
         )
 
     async def _stop_screen_stream(self, session: _ClientSession) -> None:
@@ -524,6 +525,8 @@ class LocalWebSocketServer:
                     monitor=msg.monitor,
                     prefer_p2p=msg.prefer_p2p,
                     hide_cursor=msg.hide_cursor,
+                    roi=msg.roi,
+                    clear_roi=(msg.roi is None),
                 )
         elif isinstance(msg, ScreenAckMessage):
             if session.screen_streamer is not None:

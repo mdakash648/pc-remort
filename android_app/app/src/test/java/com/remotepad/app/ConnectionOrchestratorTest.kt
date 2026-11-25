@@ -383,4 +383,11 @@ class ConnectionOrchestratorTest {
         assertEquals(ReconnectCycleResult.EXHAUSTED, onlineResult)
         assertEquals(listOf(1, 2, 3, 4, 5), attempts)
     }
+
+    @Test
+    fun relayConfig_allows_custom_pc_id_including_akash_pc() {
+        val cfg = RelayConfig("ws://182.255.88.108:8770", "akash-pc", "rpad-7f4c9a2e8b1d6305")
+        assertTrue(cfg.isValid)
+        assertEquals("akash-pc", cfg.deviceId)
+    }
 }

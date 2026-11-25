@@ -73,12 +73,27 @@ def sync_config_to_shared(
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.exists() and src.resolve() != dst.resolve():
-            should_copy = (not dst.exists()) or (src.stat().st_mtime > dst.stat().st_mtime)
-            if should_copy:
+            if not dst.exists():
                 shutil.copy2(src, dst)
                 logger.info("Synced config from %s to shared path %s", src, dst)
+            else:
+                # Both exist: check relay settings to avoid clobbering configured settings
+                src_cfg = AgentConfig.load(src)
+                dst_cfg = AgentConfig.load(dst)
+                if not src_cfg.relay_device_id and dst_cfg.relay_device_id:
+                    shutil.copy2(dst, src)
+                    logger.info("Synced configured settings from %s back to user config %s", dst, src)
+                elif src_cfg.relay_device_id and not dst_cfg.relay_device_id:
+                    shutil.copy2(src, dst)
+                    logger.info("Synced configured settings from %s to shared path %s", src, dst)
+                elif src.stat().st_mtime > dst.stat().st_mtime:
+                    shutil.copy2(src, dst)
+                    logger.info("Synced newer config from %s to shared path %s", src, dst)
+                elif dst.stat().st_mtime > src.stat().st_mtime:
+                    shutil.copy2(dst, src)
+                    logger.info("Synced newer config from %s to user path %s", dst, src)
     except OSError as exc:
-        logger.debug("Could not sync config to shared path %s: %s", dst, exc)
+        logger.debug("Could not sync config between %s and %s: %s", src, dst, exc)
     return dst
 
 
@@ -88,14 +103,15 @@ def _resolve_default_load_path() -> Path:
     user_path = get_user_config_dir() / "config.json"
     shared_path = get_shared_config_path()
     if user_path.exists() and shared_path.exists():
-        try:
-            if shared_path.stat().st_mtime > user_path.stat().st_mtime:
-                return shared_path
-        except OSError:
-            pass
+        sync_config_to_shared(user_path, shared_path)
         return user_path
     if shared_path.exists():
-        return shared_path
+        try:
+            user_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(shared_path, user_path)
+            return user_path
+        except OSError:
+            return shared_path
     return user_path
 
 
@@ -192,10 +208,6 @@ class AgentConfig:
                 return cls()
             valid_fields = {f for f in cls.__dataclass_fields__}
             filtered = {k: v for k, v in raw.items() if k in valid_fields}
-            if filtered.get("relay_device_id") == "akash-pc":
-                filtered["relay_device_id"] = ""
-            if filtered.get("relay_token") in ("rpad-7f4c9a2e8b1d6305", "@k@$h@ndn@zmuL55"):
-                filtered["relay_token"] = ""
             return cls(**filtered)
         except Exception as exc:
             logger.warning("Failed to load config from %s: %s", config_path, exc)

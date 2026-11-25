@@ -303,6 +303,35 @@ def test_sync_config_to_shared_copies_user_config(tmp_path: Path) -> None:
     assert loaded.relay_token == "rpad-9999888877776666"
 
 
+def test_akash_pc_id_persists_across_load(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg = AgentConfig(relay_device_id="akash-pc", relay_token="@k@$h@ndn@zmul")
+    cfg.save(cfg_file)
+
+    loaded = AgentConfig.load(cfg_file)
+    assert loaded.relay_device_id == "akash-pc"
+    assert loaded.relay_token == "@k@$h@ndn@zmul"
+
+
+def test_sync_config_preserves_configured_shared_when_user_is_empty(tmp_path: Path) -> None:
+    user_cfg = tmp_path / "user" / "config.json"
+    shared_cfg = tmp_path / "shared" / "config.json"
+
+    # User config starts empty (e.g. fresh launch or unconfigured AppData)
+    AgentConfig().save(user_cfg)
+    # Shared config was configured by service or previous run
+    AgentConfig(relay_device_id="akash-pc", relay_token="@k@$h@ndn@zmul").save(shared_cfg)
+
+    # Syncing must NOT overwrite shared with empty user config; it must backfill user config
+    sync_config_to_shared(user_path=user_cfg, shared_path=shared_cfg)
+
+    reloaded_user = AgentConfig.load(user_cfg)
+    reloaded_shared = AgentConfig.load(shared_cfg)
+    assert reloaded_user.relay_device_id == "akash-pc"
+    assert reloaded_shared.relay_device_id == "akash-pc"
+    assert reloaded_user.relay_token == "@k@$h@ndn@zmul"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only VkKeyScanW test")
 def test_winlogon_ascii_vk_encoding() -> None:
     digit_events = _encode_ascii_vk_inputs("5")

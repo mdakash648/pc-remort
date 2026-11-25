@@ -65,6 +65,7 @@ object Protocol {
         monitor: Int = 0,
         preferP2p: Boolean = true,
         hideCursor: Boolean = false,
+        roi: List<Float>? = null,
     ): String = json.encodeToString(
         ScreenStartMessage(
             quality = quality,
@@ -73,6 +74,7 @@ object Protocol {
             monitor = monitor.coerceAtLeast(0),
             prefer_p2p = preferP2p,
             hide_cursor = hideCursor,
+            roi = roi,
         )
     )
 
@@ -85,6 +87,7 @@ object Protocol {
         monitor: Int? = null,
         preferP2p: Boolean? = null,
         hideCursor: Boolean? = null,
+        roi: List<Float>? = null,
     ): String = json.encodeToString(
         ScreenConfigMessage(
             quality = quality,
@@ -93,6 +96,7 @@ object Protocol {
             monitor = monitor?.coerceAtLeast(0),
             prefer_p2p = preferP2p,
             hide_cursor = hideCursor,
+            roi = roi,
         )
     )
 

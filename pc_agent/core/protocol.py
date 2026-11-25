@@ -20,7 +20,7 @@ ButtonState = Literal["down", "up"]
 
 VALID_BUTTONS = frozenset({"left", "middle", "right"})
 VALID_BUTTON_STATES = frozenset({"down", "up"})
-VALID_SCREEN_QUALITIES = frozenset({"auto", "hd", "balanced", "fast"})
+VALID_SCREEN_QUALITIES = frozenset({"auto", "hd", "balanced", "fast", "text"})
 
 MAX_MOVE_DELTA = 2000.0
 MAX_SCROLL_DELTA = 200.0
@@ -126,6 +126,7 @@ class ScreenStartMessage:
     monitor: int = 0
     prefer_p2p: bool = True
     hide_cursor: bool = False
+    roi: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +142,7 @@ class ScreenConfigMessage:
     monitor: int | None = None
     prefer_p2p: bool | None = None
     hide_cursor: bool | None = None
+    roi: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +371,16 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
         prefer_p2p = raw_p2p if isinstance(raw_p2p, bool) else True
         raw_hide_cursor = data.get("hide_cursor", False)
         hide_cursor = raw_hide_cursor if isinstance(raw_hide_cursor, bool) else False
+        roi: tuple[float, float, float, float] | None = None
+        if "roi" in data:
+            raw_roi = data.get("roi")
+            if isinstance(raw_roi, (list, tuple)) and len(raw_roi) == 4:
+                try:
+                    rx, ry, rw, rh = (float(v) for v in raw_roi)
+                    if 0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0 and 0.0 < rw <= 1.0 and 0.0 < rh <= 1.0:
+                        roi = (rx, ry, min(rw, 1.0 - rx), min(rh, 1.0 - ry))
+                except (ValueError, TypeError):
+                    pass
         return ScreenStartMessage(
             quality=quality,
             fps=fps,
@@ -376,6 +388,7 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
             monitor=monitor,
             prefer_p2p=prefer_p2p,
             hide_cursor=hide_cursor,
+            roi=roi,
         )
 
     if msg_type == "screen_stop":
@@ -412,6 +425,18 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
             raw_hide_cursor = data.get("hide_cursor")
             if isinstance(raw_hide_cursor, bool):
                 hide_cursor = raw_hide_cursor
+        roi: tuple[float, float, float, float] | None = None
+        if "roi" in data:
+            raw_roi = data.get("roi")
+            if raw_roi is None:
+                roi = None
+            elif isinstance(raw_roi, (list, tuple)) and len(raw_roi) == 4:
+                try:
+                    rx, ry, rw, rh = (float(v) for v in raw_roi)
+                    if 0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0 and 0.0 < rw <= 1.0 and 0.0 < rh <= 1.0:
+                        roi = (rx, ry, min(rw, 1.0 - rx), min(rh, 1.0 - ry))
+                except (ValueError, TypeError):
+                    pass
         return ScreenConfigMessage(
             quality=quality,
             fps=fps,
@@ -419,6 +444,7 @@ def parse_message(raw: str | bytes) -> ParsedMessage | None:
             monitor=monitor,
             prefer_p2p=prefer_p2p,
             hide_cursor=hide_cursor,
+            roi=roi,
         )
 
     if msg_type == "screen_ack":

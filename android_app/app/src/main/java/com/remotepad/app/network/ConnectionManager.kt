@@ -268,16 +268,12 @@ class ConnectionManager private constructor(context: Context) {
     val relayUrl: StateFlow<String> = _relayUrl.asStateFlow()
 
     private val _relayDeviceId = MutableStateFlow(
-        prefs.getString(KEY_RELAY_DEVICE_ID, DEFAULT_RELAY_DEVICE_ID)?.let {
-            if (it == "akash-pc") "" else it
-        } ?: DEFAULT_RELAY_DEVICE_ID
+        prefs.getString(KEY_RELAY_DEVICE_ID, DEFAULT_RELAY_DEVICE_ID) ?: DEFAULT_RELAY_DEVICE_ID
     )
     val relayDeviceId: StateFlow<String> = _relayDeviceId.asStateFlow()
 
     private val _relayToken = MutableStateFlow(
-        prefs.getString(KEY_RELAY_TOKEN, DEFAULT_RELAY_TOKEN)?.let {
-            if (it == "rpad-7f4c9a2e8b1d6305") "" else it
-        } ?: DEFAULT_RELAY_TOKEN
+        prefs.getString(KEY_RELAY_TOKEN, DEFAULT_RELAY_TOKEN) ?: DEFAULT_RELAY_TOKEN
     )
     val relayToken: StateFlow<String> = _relayToken.asStateFlow()
 
@@ -425,16 +421,6 @@ class ConnectionManager private constructor(context: Context) {
     )
 
     init {
-        // Clear any old hardcoded default PC ID and Token if present in preferences
-        val storedDevId = prefs.getString(KEY_RELAY_DEVICE_ID, null)
-        val storedToken = prefs.getString(KEY_RELAY_TOKEN, null)
-        if (storedDevId == "akash-pc" || storedToken == "rpad-7f4c9a2e8b1d6305") {
-            val editor = prefs.edit()
-            if (storedDevId == "akash-pc") editor.putString(KEY_RELAY_DEVICE_ID, "")
-            if (storedToken == "rpad-7f4c9a2e8b1d6305") editor.putString(KEY_RELAY_TOKEN, "")
-            editor.apply()
-        }
-
         micSession = MicSessionController(
             adapter = object : MicSessionAdapter {
                 override fun hasRecordAudioPermission(): Boolean {
@@ -565,14 +551,17 @@ class ConnectionManager private constructor(context: Context) {
 
     fun onRelayUrlChanged(value: String) {
         _relayUrl.value = value
+        prefs.edit().putString(KEY_RELAY_URL, value.trim()).apply()
     }
 
     fun onRelayDeviceIdChanged(value: String) {
         _relayDeviceId.value = value
+        prefs.edit().putString(KEY_RELAY_DEVICE_ID, value.trim()).apply()
     }
 
     fun onRelayTokenChanged(value: String) {
         _relayToken.value = value
+        prefs.edit().putString(KEY_RELAY_TOKEN, value.trim()).apply()
     }
 
     fun onAutoConnectChanged(enabled: Boolean) {

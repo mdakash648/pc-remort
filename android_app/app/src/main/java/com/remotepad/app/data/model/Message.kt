@@ -60,6 +60,7 @@ data class ScreenStartMessage(
     val monitor: Int = 0,
     val prefer_p2p: Boolean = true,
     val hide_cursor: Boolean = false,
+    val roi: List<Float>? = null,
 )
 
 @Serializable
@@ -76,6 +77,7 @@ data class ScreenConfigMessage(
     val monitor: Int? = null,
     val prefer_p2p: Boolean? = null,
     val hide_cursor: Boolean? = null,
+    val roi: List<Float>? = null,
 )
 
 @Serializable

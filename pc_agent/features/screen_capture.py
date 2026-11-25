@@ -39,6 +39,10 @@ SCREEN_HEADER_SIZE = SCREEN_HEADER_STRUCT.size  # 20 bytes
 FLAG_CODEC_JPEG = 0x00
 FLAG_KEYFRAME = 0x02
 FLAG_HAS_CURSOR = 0x04
+FLAG_ROI = 0x08
+
+SCREEN_ROI_HEADER_STRUCT = struct.Struct(">4sBBBBIHHHHHHHH")
+SCREEN_ROI_HEADER_SIZE = SCREEN_ROI_HEADER_STRUCT.size  # 28 bytes
 
 MAX_FRAME_PAYLOAD_BYTES = 360 * 1024  # Safely below VPS relay 512 KB maxPayload
 
@@ -86,6 +90,7 @@ class CapturedFrame:
     cursor_y: int  # 0..65535 normalized within monitor
     has_cursor: bool
     raw_crc32: int | None = None
+    roi: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,10 +104,15 @@ class UnpackedScreenFrame:
     cursor_x: int
     cursor_y: int
     payload: bytes
+    roi: tuple[float, float, float, float] | None = None
 
     @property
     def has_cursor(self) -> bool:
         return bool(self.flags & FLAG_HAS_CURSOR)
+
+    @property
+    def has_roi(self) -> bool:
+        return bool(self.flags & FLAG_ROI)
 
 
 def pack_screen_frame(
@@ -117,44 +127,86 @@ def pack_screen_frame(
     has_cursor: bool,
     payload: bytes,
     keyframe: bool = True,
+    roi: tuple[float, float, float, float] | None = None,
 ) -> bytes:
-    """Pack a 20-byte RSCR header + encoded image payload."""
+    """Pack an RSCR header (20 bytes standard or 28 bytes if ROI is active) + JPEG payload."""
     flags = FLAG_CODEC_JPEG
     if keyframe:
         flags |= FLAG_KEYFRAME
     if has_cursor:
         flags |= FLAG_HAS_CURSOR
-    header = SCREEN_HEADER_STRUCT.pack(
-        SCREEN_MAGIC,
-        flags & 0xFF,
-        monitor_index & 0xFF,
-        max(monitor_count, 1) & 0xFF,
-        0,
-        seq & 0xFFFFFFFF,
-        min(max(width, 1), 65535),
-        min(max(height, 1), 65535),
-        min(max(cursor_x, 0), 65535),
-        min(max(cursor_y, 0), 65535),
-    )
+    if roi is not None:
+        flags |= FLAG_ROI
+        rx, ry, rw, rh = roi
+        header = SCREEN_ROI_HEADER_STRUCT.pack(
+            SCREEN_MAGIC,
+            flags & 0xFF,
+            monitor_index & 0xFF,
+            max(monitor_count, 1) & 0xFF,
+            0,
+            seq & 0xFFFFFFFF,
+            min(max(width, 1), 65535),
+            min(max(height, 1), 65535),
+            min(max(cursor_x, 0), 65535),
+            min(max(cursor_y, 0), 65535),
+            min(max(int(round(rx * 65535.0)), 0), 65535),
+            min(max(int(round(ry * 65535.0)), 0), 65535),
+            min(max(int(round(rw * 65535.0)), 0), 65535),
+            min(max(int(round(rh * 65535.0)), 0), 65535),
+        )
+    else:
+        header = SCREEN_HEADER_STRUCT.pack(
+            SCREEN_MAGIC,
+            flags & 0xFF,
+            monitor_index & 0xFF,
+            max(monitor_count, 1) & 0xFF,
+            0,
+            seq & 0xFFFFFFFF,
+            min(max(width, 1), 65535),
+            min(max(height, 1), 65535),
+            min(max(cursor_x, 0), 65535),
+            min(max(cursor_y, 0), 65535),
+        )
     return header + payload
 
 
 def unpack_screen_frame(data: bytes) -> UnpackedScreenFrame | None:
-    """Unpack an RSCR binary screen frame."""
+    """Unpack an RSCR binary screen frame (standard 20-byte or ROI 28-byte)."""
     if len(data) < SCREEN_HEADER_SIZE or data[:4] != SCREEN_MAGIC:
         return None
-    _magic, flags, mon_idx, mon_cnt, _res, seq, w, h, cx, cy = SCREEN_HEADER_STRUCT.unpack_from(data, 0)
-    return UnpackedScreenFrame(
-        flags=flags,
-        monitor_index=mon_idx,
-        monitor_count=mon_cnt,
-        seq=seq,
-        width=w,
-        height=h,
-        cursor_x=cx,
-        cursor_y=cy,
-        payload=data[SCREEN_HEADER_SIZE:],
-    )
+    flags = data[4]
+    if flags & FLAG_ROI:
+        if len(data) < SCREEN_ROI_HEADER_SIZE:
+            return None
+        _magic, flags, mon_idx, mon_cnt, _res, seq, w, h, cx, cy, rx, ry, rw, rh = (
+            SCREEN_ROI_HEADER_STRUCT.unpack_from(data, 0)
+        )
+        return UnpackedScreenFrame(
+            flags=flags,
+            monitor_index=mon_idx,
+            monitor_count=mon_cnt,
+            seq=seq,
+            width=w,
+            height=h,
+            cursor_x=cx,
+            cursor_y=cy,
+            payload=data[SCREEN_ROI_HEADER_SIZE:],
+            roi=(rx / 65535.0, ry / 65535.0, rw / 65535.0, rh / 65535.0),
+        )
+    else:
+        _magic, flags, mon_idx, mon_cnt, _res, seq, w, h, cx, cy = SCREEN_HEADER_STRUCT.unpack_from(data, 0)
+        return UnpackedScreenFrame(
+            flags=flags,
+            monitor_index=mon_idx,
+            monitor_count=mon_cnt,
+            seq=seq,
+            width=w,
+            height=h,
+            cursor_x=cx,
+            cursor_y=cy,
+            payload=data[SCREEN_HEADER_SIZE:],
+            roi=None,
+        )
 
 
 def resolve_quality_profile(
@@ -163,24 +215,27 @@ def resolve_quality_profile(
     requested_fps: int,
     requested_max_width: int,
 ) -> tuple[int, int, int]:
-    """Return (max_width, jpeg_quality, target_fps) tuned for crisp quality + high FPS over LAN/P2P/VPS."""
+    """Return (max_width, jpeg_quality, target_fps) prioritizing text readability on mobile/P2P/VPS.
+    
+    On slow cellular or remote relay links, frame rate is reduced down to 2-6 fps
+    instead of crushing spatial resolution and destroying 12-14pt fonts.
+    """
     q = quality.strip().lower()
-    if q == "hd":
+    if q in ("hd", "text"):
         if transport_kind == "lan":
             base_w, base_q, base_fps = 1920, 86, 30
         elif transport_kind == "p2p":
-            base_w, base_q, base_fps = 1600, 74, 24
+            base_w, base_q, base_fps = 1920, 80, 16
         else:  # "vps"
-            base_w, base_q, base_fps = 1440, 70, 20
+            base_w, base_q, base_fps = 1920, 78, 12
     elif q == "balanced":
         if transport_kind == "lan":
-            base_w, base_q, base_fps = 1440, 74, 24
+            base_w, base_q, base_fps = 1600, 76, 24
         elif transport_kind == "p2p":
-            base_w, base_q, base_fps = 1280, 62, 24
+            base_w, base_q, base_fps = 1440, 70, 16
         else:  # "vps"
-            base_w, base_q, base_fps = 1152, 58, 20
+            base_w, base_q, base_fps = 1280, 66, 12
     elif q == "fast":
-        # 960px is exact 2:1 downscale of 1080p -> fastest GDI StretchBlt + compact frames at up to 30fps
         if transport_kind == "lan":
             base_w, base_q, base_fps = 960, 56, 30
         elif transport_kind == "p2p":
@@ -189,52 +244,54 @@ def resolve_quality_profile(
             base_w, base_q, base_fps = 960, 44, 30
     else:  # "auto"
         if transport_kind == "lan":
-            # Native 1080p avoids blurry resize AND encodes quickly on LAN
             base_w, base_q, base_fps = 1920, 82, 30
         elif transport_kind == "p2p":
-            # Compact P2P profile keeps UDP bursts small (~35-55 pkts) so NAT/ISP never drops frames
-            base_w, base_q, base_fps = 1280, 64, 24
+            base_w, base_q, base_fps = 1920, 76, 24
         else:  # "vps"
-            base_w, base_q, base_fps = 1152, 60, 20
+            base_w, base_q, base_fps = 1600, 74, 20
 
-    final_w = min(max(min(base_w, requested_max_width), 320), 1920)
+    final_w = min(max(min(base_w, requested_max_width), 640), 1920)
     final_fps = min(max(min(base_fps, requested_fps), 1), 30)
     return final_w, base_q, final_fps
 
 
 def resolve_jpeg_subsampling(quality: str, transport_kind: str) -> int:
-    """Choose chroma subsampling: 0=4:4:4 (sharpest text), 1=4:2:2 (crisp+fast), 2=4:2:0 (smallest)."""
+    """Choose chroma subsampling: 0=4:4:4 (sharp text), 1=4:2:2 (crisp edges), 2=4:2:0 (smallest).
+    
+    Windows ClearType fonts require 4:4:4 (0) or 4:2:2 (1) to prevent severe subpixel color bleeding.
+    4:2:0 (2) is restricted only to 'fast' mode.
+    """
     q = quality.strip().lower()
-    if q == "hd" and transport_kind == "lan":
-        return 0
-    if q == "fast" or transport_kind in ("p2p", "vps"):
-        # 4:2:0 shrinks remote frames by ~30-35% with minimal visual difference on phone displays
-        return 2
+    if q in ("hd", "text"):
+        return 0  # 4:4:4: Perfect RGB edge fidelity for 12-14pt fonts everywhere
+    if q == "fast":
+        return 2  # 4:2:0: Smallest payload for high-speed motion
+    if transport_kind == "lan":
+        return 0  # 4:4:4 on local Wi-Fi
+    # On P2P/VPS: 4:2:2 preserves ClearType horizontal subpixels while saving 20% byte payload
     return 1
 
 
-def resolve_max_frame_bytes(quality: str, transport_kind: str) -> int:
-    """Choose per-frame byte budget so P2P UDP bursts stay reliable and VPS links stay lag-free."""
+def resolve_max_frame_bytes(quality: str, transport_kind: str, is_roi: bool = False) -> int:
+    """Per-frame byte budget tuned for crisp text while respecting transport upper bounds."""
+    if is_roi:
+        # Cropped viewport is smaller in dimensions -> requires far fewer bytes for crystal clarity
+        return 65 * 1024
+
     q = quality.strip().lower()
     if transport_kind == "lan":
-        if q == "hd":
-            return 340 * 1024
-        if q == "balanced":
-            return 180 * 1024
-        if q == "fast":
-            return 80 * 1024
-        return 240 * 1024
+        return 340 * 1024 if q in ("hd", "text") else 240 * 1024
     if transport_kind == "p2p":
-        if q == "hd":
-            return 96 * 1024
+        if q in ("hd", "text"):
+            return 140 * 1024  # Well within 320 UDP chunks (358 KB max limit)
         if q == "balanced":
             return 52 * 1024
         if q == "fast":
             return 28 * 1024
-        return 58 * 1024
+        return 60 * 1024
     # "vps"
-    if q == "hd":
-        return 84 * 1024
+    if q in ("hd", "text"):
+        return 120 * 1024  # Well below VPS relay 512 KB limit
     if q == "balanced":
         return 44 * 1024
     if q == "fast":
@@ -247,9 +304,13 @@ def encode_jpeg_bounded(
     max_width: int,
     jpeg_quality: int,
     max_bytes: int = MAX_FRAME_PAYLOAD_BYTES,
-    subsampling: int = 1,
+    subsampling: int = 0,
 ) -> tuple[bytes, int, int]:
-    """Resize if needed and encode image to JPEG strictly within max_bytes."""
+    """Resize if needed and encode image to JPEG strictly within max_bytes with absolute safety cap.
+    
+    Subsampling transition order: 4:4:4 -> 4:2:2 first. 4:2:0 is strictly a last resort.
+    Guarantees output never exceeds min(max_bytes, 350 KB) to prevent P2P/VPS socket drop.
+    """
     img = image
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -257,35 +318,58 @@ def encode_jpeg_bounded(
     w, h = img.size
     if w > max_width and w > 0:
         scale = max_width / float(w)
-        new_w = max(int(round(w * scale)), 16)
-        new_h = max(int(round(h * scale)), 16)
-        # Keep even dimensions for crisp scaling on GPU textures
-        new_w = max(new_w - (new_w % 2), 16)
-        new_h = max(new_h - (new_h % 2), 16)
+        new_w = max(int(round(w * scale)) & ~1, 16)
+        new_h = max(int(round(h * scale)) & ~1, 16)
         img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
-    quality = min(max(int(jpeg_quality), 20), 92)
+    # Upper transport safety limit (P2P chunk ceiling = 358 KB)
+    hard_limit = min(max_bytes, 350 * 1024)
+    quality = min(max(int(jpeg_quality), 35), 92)
     cur_subsampling = subsampling
+
     for _ in range(4):
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, subsampling=cur_subsampling, optimize=False)
         data = buf.getvalue()
-        if len(data) <= max_bytes:
+        if len(data) <= hard_limit:
             return data, img.size[0], img.size[1]
-        if cur_subsampling < 2:
-            cur_subsampling = 2
-        elif quality > 34:
-            quality = max(quality - 16, 30)
-        else:
-            cw, ch = img.size
-            nw = max(int(cw * 0.78) & ~1, 320)
-            nh = max(int(ch * 0.78) & ~1, 180)
-            img = img.resize((nw, nh), Image.Resampling.BILINEAR)
 
-    # Final fallback guaranteed small
+        # 1. First degrade quality moderately while preserving chroma
+        if quality > 55:
+            quality = max(quality - 10, 50)
+        # 2. Then step down chroma: 4:4:4 -> 4:2:2
+        elif cur_subsampling == 0:
+            cur_subsampling = 1
+        # 3. Then drop quality further
+        elif quality > 42:
+            quality = max(quality - 8, 38)
+        # 4. Only as last resort drop to 4:2:0
+        elif cur_subsampling == 1:
+            cur_subsampling = 2
+        else:
+            # Gentle spatial downscale if still oversized
+            cw, ch = img.size
+            if cw > 960:
+                nw = max(int(cw * 0.85) & ~1, 640)
+                nh = max(int(ch * 0.85) & ~1, 360)
+                img = img.resize((nw, nh), Image.Resampling.BILINEAR)
+            else:
+                quality = 35
+                break
+
+    # Final hard clamp guarantee
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=28, subsampling=2, optimize=False)
-    return buf.getvalue(), img.size[0], img.size[1]
+    img.save(buf, format="JPEG", quality=max(quality, 32), subsampling=cur_subsampling, optimize=False)
+    data = buf.getvalue()
+    if len(data) > hard_limit:
+        # Emergency extreme fallback to guarantee frame is never dropped by network transport
+        cw, ch = img.size
+        img_small = img.resize((max(int(cw * 0.70) & ~1, 480), max(int(ch * 0.70) & ~1, 270)), Image.Resampling.BILINEAR)
+        buf = io.BytesIO()
+        img_small.save(buf, format="JPEG", quality=30, subsampling=2, optimize=False)
+        return buf.getvalue(), img_small.size[0], img_small.size[1]
+
+    return data, img.size[0], img.size[1]
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +702,14 @@ class WindowsScreenCapturer:
         monitor_index: int = 0,
         max_width: int | None = None,
         draw_cursor: bool = True,
+        roi: tuple[float, float, float, float] | None = None,
     ) -> CapturedFrame | None:
         frame, _unchanged = self.capture_if_changed(
             monitor_index=monitor_index,
             max_width=max_width,
             last_signature=None,
             draw_cursor=draw_cursor,
+            roi=roi,
         )
         return frame
 
@@ -631,10 +717,11 @@ class WindowsScreenCapturer:
         self,
         monitor_index: int = 0,
         max_width: int | None = None,
-        last_signature: tuple[int, int, int, int, bool] | None = None,
+        last_signature: tuple[Any, ...] | None = None,
         draw_cursor: bool = True,
+        roi: tuple[float, float, float, float] | None = None,
     ) -> tuple[CapturedFrame | None, bool]:
-        """Capture monitor (optionally hardware-downscaled via GDI StretchBlt).
+        """Capture monitor (optionally cropped to ROI or hardware-downscaled via GDI StretchBlt).
 
         Returns (frame, unchanged). When unchanged is True, skips expensive RGB conversion.
         When draw_cursor is False (AnyDesk-style client-side local cursor mode), cursor coordinates
@@ -652,6 +739,7 @@ class WindowsScreenCapturer:
             max_width=max_width,
             last_signature=last_signature,
             draw_cursor=draw_cursor,
+            roi=roi,
         )
         if frame is None and not unchanged:
             # Desktop may have just transitioned (Default <-> Winlogon / UAC); rebuild cache & retry once.
@@ -663,6 +751,7 @@ class WindowsScreenCapturer:
                 max_width=max_width,
                 last_signature=last_signature,
                 draw_cursor=draw_cursor,
+                roi=roi,
             )
         return frame, unchanged
 
@@ -670,8 +759,9 @@ class WindowsScreenCapturer:
         self,
         monitor_index: int,
         max_width: int | None = None,
-        last_signature: tuple[int, int, int, int, bool] | None = None,
+        last_signature: tuple[Any, ...] | None = None,
         draw_cursor: bool = True,
+        roi: tuple[float, float, float, float] | None = None,
     ) -> tuple[CapturedFrame | None, bool]:
         assert _user32 is not None and _gdi32 is not None
         monitors = self.get_monitors()
@@ -681,11 +771,26 @@ class WindowsScreenCapturer:
         mon = monitors[mon_idx]
         w, h = mon.width, mon.height
 
-        target_w, target_h = w, h
-        if max_width is not None and 16 <= max_width < w:
-            scale = max_width / float(w)
-            target_w = max(int(round(w * scale)) & ~1, 16)
-            target_h = max(int(round(h * scale)) & ~1, 16)
+        src_x = mon.left
+        src_y = mon.top
+        src_w = w
+        src_h = h
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            src_x = mon.left + int(round(rx * w))
+            src_y = mon.top + int(round(ry * h))
+            src_w = max(int(round(rw * w)) & ~1, 16)
+            src_h = max(int(round(rh * h)) & ~1, 16)
+            if src_x + src_w > mon.right:
+                src_w = max((mon.right - src_x) & ~1, 16)
+            if src_y + src_h > mon.bottom:
+                src_h = max((mon.bottom - src_y) & ~1, 16)
+
+        target_w, target_h = src_w, src_h
+        if max_width is not None and 16 <= max_width < src_w:
+            scale = max_width / float(src_w)
+            target_w = max(int(round(src_w * scale)) & ~1, 16)
+            target_h = max(int(round(src_h * scale)) & ~1, 16)
 
         hdc_screen = _user32.GetDC(None)
         if not hdc_screen:
@@ -698,16 +803,16 @@ class WindowsScreenCapturer:
                     return None, False
                 hdc_mem, raw_view = dib
 
-                if target_w == w and target_h == h:
+                if target_w == src_w and target_h == src_h:
                     ok = _gdi32.BitBlt(
                         hdc_mem,
                         0,
                         0,
-                        w,
-                        h,
+                        src_w,
+                        src_h,
                         hdc_screen,
-                        mon.left,
-                        mon.top,
+                        src_x,
+                        src_y,
                         _SRCCOPY,
                     )
                 else:
@@ -718,10 +823,10 @@ class WindowsScreenCapturer:
                         target_w,
                         target_h,
                         hdc_screen,
-                        mon.left,
-                        mon.top,
-                        w,
-                        h,
+                        src_x,
+                        src_y,
+                        src_w,
+                        src_h,
                         _SRCCOPY,
                     )
                 if not ok:
@@ -744,9 +849,9 @@ class WindowsScreenCapturer:
                         cursor_x = min(max(cursor_x, 0), 65535)
                         cursor_y = min(max(cursor_y, 0), 65535)
 
-                        if draw_cursor and ci.hCursor:
-                            draw_x = px - mon.left
-                            draw_y = py - mon.top
+                        if draw_cursor and ci.hCursor and (src_x <= px < src_x + src_w and src_y <= py < src_y + src_h):
+                            draw_x = px - src_x
+                            draw_y = py - src_y
                             ii = _ICONINFO()
                             if _user32.GetIconInfo(ci.hCursor, ctypes.byref(ii)):
                                 try:
@@ -757,11 +862,11 @@ class WindowsScreenCapturer:
                                         _gdi32.DeleteObject(ii.hbmMask)
                                     if ii.hbmColor:
                                         _gdi32.DeleteObject(ii.hbmColor)
-                            if target_w == w and target_h == h:
+                            if target_w == src_w and target_h == src_h:
                                 _user32.DrawIconEx(hdc_mem, draw_x, draw_y, ci.hCursor, 0, 0, 0, None, _DI_NORMAL)
                             else:
-                                sx = target_w / float(w)
-                                sy = target_h / float(h)
+                                sx = target_w / float(src_w)
+                                sy = target_h / float(src_h)
                                 cur_w = max(int(_user32.GetSystemMetrics(_SM_CXCURSOR)), 16)
                                 cur_h = max(int(_user32.GetSystemMetrics(_SM_CYCURSOR)), 16)
                                 _user32.DrawIconEx(
@@ -778,9 +883,9 @@ class WindowsScreenCapturer:
 
                 raw_crc = zlib.crc32(raw_view)
                 sig = (
-                    (raw_crc, mon_idx, cursor_x, cursor_y, has_cursor)
+                    (raw_crc, mon_idx, cursor_x, cursor_y, has_cursor, roi)
                     if draw_cursor
-                    else (raw_crc, mon_idx, 0, 0, False)
+                    else (raw_crc, mon_idx, 0, 0, False, roi)
                 )
                 if last_signature is not None and last_signature == sig:
                     return None, True
@@ -796,6 +901,7 @@ class WindowsScreenCapturer:
                         cursor_y=cursor_y,
                         has_cursor=has_cursor,
                         raw_crc32=raw_crc,
+                        roi=roi,
                     ),
                     False,
                 )
@@ -857,9 +963,12 @@ class ScreenStreamer:
         self._ewma_rtt: float = 0.08
         self._adapt_q_drop: int = 0
         self._adapt_scale: float = 1.0
+        self._adapt_fps_scale: float = 1.0
         self._adapt_budget_ratio: float = 1.0
         self._consecutive_timeouts: int = 0
         self._p2p_acked_count: int = 0
+        self._active_roi: tuple[float, float, float, float] | None = None
+        self._input_activity_ts: float = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -879,6 +988,7 @@ class ScreenStreamer:
 
     def notify_input_activity(self) -> None:
         """Wake the capture loop immediately on mouse/keyboard activity for instant feedback."""
+        self._input_activity_ts = time.monotonic()
         if self._running:
             self._wake_event.set()
 
@@ -888,6 +998,7 @@ class ScreenStreamer:
     def _reset_adaptation(self, *, clear_p2p_probe: bool = False) -> None:
         self._adapt_q_drop = 0
         self._adapt_scale = 1.0
+        self._adapt_fps_scale = 1.0
         self._adapt_budget_ratio = 1.0
         self._consecutive_timeouts = 0
         if clear_p2p_probe:
@@ -902,6 +1013,7 @@ class ScreenStreamer:
         monitor: int = 0,
         prefer_p2p: bool = True,
         hide_cursor: bool = False,
+        roi: tuple[float, float, float, float] | None = None,
     ) -> None:
         self._quality = quality
         self._fps = fps
@@ -909,6 +1021,7 @@ class ScreenStreamer:
         self._monitor = monitor
         self._prefer_p2p = prefer_p2p
         self._hide_cursor = hide_cursor
+        self._active_roi = roi
         self._force_keyframe = True
         self._last_signature = None
         self._acked_seq = self._sent_seq
@@ -927,13 +1040,14 @@ class ScreenStreamer:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="remotepad-screen")
         self._task = asyncio.create_task(self._stream_loop(), name="remotepad-screen-stream")
         logger.info(
-            "Screen stream started (quality=%s, fps=%d, max_w=%d, mon=%d, relay=%s, hide_cursor=%s)",
+            "Screen stream started (quality=%s, fps=%d, max_w=%d, mon=%d, relay=%s, hide_cursor=%s, roi=%s)",
             quality,
             fps,
             max_width,
             monitor,
             self._is_via_relay,
             hide_cursor,
+            roi,
         )
 
     def update_config(
@@ -945,6 +1059,8 @@ class ScreenStreamer:
         monitor: int | None = None,
         prefer_p2p: bool | None = None,
         hide_cursor: bool | None = None,
+        roi: tuple[float, float, float, float] | None = None,
+        clear_roi: bool = False,
     ) -> None:
         reset_flow = False
         if quality is not None:
@@ -965,6 +1081,12 @@ class ScreenStreamer:
             self._prefer_p2p = prefer_p2p
         if hide_cursor is not None:
             self._hide_cursor = hide_cursor
+        if roi is not None or clear_roi:
+            new_roi = None if clear_roi else roi
+            if new_roi != self._active_roi:
+                self._active_roi = new_roi
+                self._force_keyframe = True
+                self._last_signature = None
         if reset_flow:
             # Clear stale in-flight counter so quality/transport switches take effect immediately
             self._acked_seq = self._sent_seq
@@ -993,17 +1115,19 @@ class ScreenStreamer:
             if sent_transport == "lan":
                 self._reset_adaptation(clear_p2p_probe=False)
             else:
-                slow_thr = 0.15 if sent_transport == "p2p" else 0.20
-                fast_thr = 0.085 if sent_transport == "p2p" else 0.12
+                slow_thr = 0.30 if sent_transport == "p2p" else 0.40
+                fast_thr = 0.14 if sent_transport == "p2p" else 0.18
                 if rtt > slow_thr:
-                    self._adapt_q_drop = min(self._adapt_q_drop + 4, 22)
+                    self._adapt_fps_scale = max(self._adapt_fps_scale * 0.78, 0.20)
+                    self._adapt_q_drop = min(self._adapt_q_drop + 2, 10)
                     self._adapt_budget_ratio = max(self._adapt_budget_ratio * 0.85, 0.45)
-                    if rtt > slow_thr * 1.7:
-                        self._adapt_scale = max(self._adapt_scale * 0.88, 0.62)
+                    if rtt > slow_thr * 1.6:
+                        self._adapt_scale = max(self._adapt_scale * 0.95, 0.88)
                 elif rtt < fast_thr:
-                    self._adapt_q_drop = max(self._adapt_q_drop - 2, 0)
+                    self._adapt_fps_scale = min(self._adapt_fps_scale + 0.08, 1.0)
+                    self._adapt_q_drop = max(self._adapt_q_drop - 1, 0)
                     self._adapt_budget_ratio = min(self._adapt_budget_ratio + 0.06, 1.0)
-                    self._adapt_scale = min(self._adapt_scale + 0.05, 1.0)
+                    self._adapt_scale = min(self._adapt_scale + 0.04, 1.0)
 
         # Prune stale send timestamps
         if len(self._sent_times) > 32:
@@ -1046,15 +1170,16 @@ class ScreenStreamer:
     def _apply_timeout_backoff(self, transport_kind: str) -> None:
         self._consecutive_timeouts += 1
         if transport_kind == "p2p":
-            # UDP chunk loss: aggressively shrink burst size & retry quickly so P2P stays alive!
-            self._adapt_q_drop = min(self._adapt_q_drop + 8, 24)
-            self._adapt_budget_ratio = max(self._adapt_budget_ratio * 0.68, 0.38)
-            self._adapt_scale = max(self._adapt_scale * 0.82, 0.60)
+            self._adapt_fps_scale = max(self._adapt_fps_scale * 0.65, 0.15)
+            self._adapt_q_drop = min(self._adapt_q_drop + 4, 10)
+            self._adapt_budget_ratio = max(self._adapt_budget_ratio * 0.75, 0.45)
+            self._adapt_scale = max(self._adapt_scale * 0.95, 0.88)
             self._force_keyframe = True
         elif transport_kind == "vps":
-            self._adapt_q_drop = min(self._adapt_q_drop + 8, 24)
-            self._adapt_budget_ratio = max(self._adapt_budget_ratio * 0.65, 0.42)
-            self._adapt_scale = max(self._adapt_scale * 0.80, 0.60)
+            self._adapt_fps_scale = max(self._adapt_fps_scale * 0.68, 0.20)
+            self._adapt_q_drop = min(self._adapt_q_drop + 4, 10)
+            self._adapt_budget_ratio = max(self._adapt_budget_ratio * 0.75, 0.48)
+            self._adapt_scale = max(self._adapt_scale * 0.95, 0.90)
 
     def _capture_and_encode_sync(
         self,
@@ -1065,24 +1190,40 @@ class ScreenStreamer:
         force_send: bool,
         max_bytes: int = MAX_FRAME_PAYLOAD_BYTES,
         draw_cursor: bool = True,
-    ) -> tuple[bytes, int, int, int, int, int, int, bool, tuple[int, int, int, int, bool]] | None:
+        roi: tuple[float, float, float, float] | None = None,
+    ) -> tuple[bytes, int, int, int, int, int, int, bool, tuple[Any, ...], tuple[float, float, float, float] | None] | None:
         last_sig = None if force_send else self._last_signature
         capture_fast = getattr(self._capturer, "capture_if_changed", None)
         if callable(capture_fast):
-            captured, unchanged = capture_fast(
-                monitor_index=monitor_index,
-                max_width=max_width,
-                last_signature=last_sig,
-                draw_cursor=draw_cursor,
-            )
+            try:
+                captured, unchanged = capture_fast(
+                    monitor_index=monitor_index,
+                    max_width=max_width,
+                    last_signature=last_sig,
+                    draw_cursor=draw_cursor,
+                    roi=roi,
+                )
+            except TypeError:
+                captured, unchanged = capture_fast(
+                    monitor_index=monitor_index,
+                    max_width=max_width,
+                    last_signature=last_sig,
+                    draw_cursor=draw_cursor,
+                )
             if unchanged or captured is None:
                 return None
         else:
-            captured = self._capturer.capture(monitor_index)
+            try:
+                captured = self._capturer.capture(monitor_index, max_width=max_width, draw_cursor=draw_cursor, roi=roi)
+            except TypeError:
+                try:
+                    captured = self._capturer.capture(monitor_index, max_width=max_width, draw_cursor=draw_cursor)
+                except TypeError:
+                    captured = self._capturer.capture(monitor_index)
             if captured is None:
                 return None
 
-        # Full-pixel C CRC32 + exact cursor coords (skipped when client renders local AnyDesk-style cursor)
+        # Full-pixel C CRC32 + exact cursor coords + roi
         pixel_crc = captured.raw_crc32 if captured.raw_crc32 is not None else zlib.crc32(captured.image.tobytes())
         sig = (
             (
@@ -1091,9 +1232,10 @@ class ScreenStreamer:
                 captured.cursor_x,
                 captured.cursor_y,
                 captured.has_cursor,
+                roi,
             )
             if draw_cursor
-            else (pixel_crc, captured.monitor_index, 0, 0, False)
+            else (pixel_crc, captured.monitor_index, 0, 0, False, roi)
         )
         if not force_send and self._last_signature == sig:
             return None
@@ -1115,10 +1257,14 @@ class ScreenStreamer:
             captured.cursor_y,
             captured.has_cursor,
             sig,
+            captured.roi,
         )
 
     async def _stream_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        refinement_armed_ts: float | None = None
+        refinement_sent = False
+
         try:
             while self._running:
                 loop_start = time.monotonic()
@@ -1130,6 +1276,8 @@ class ScreenStreamer:
                     self._sent_times.clear()
                     self._force_keyframe = True
                     self._reset_adaptation(clear_p2p_probe=(transport_kind == "p2p"))
+                    refinement_armed_ts = None
+                    refinement_sent = False
 
                 if transport_kind == "lan":
                     in_flight_limit = self._LAN_IN_FLIGHT_WINDOW
@@ -1137,13 +1285,12 @@ class ScreenStreamer:
                 elif transport_kind == "p2p":
                     in_flight_limit = self._P2P_IN_FLIGHT_WINDOW
                     ack_timeout = min(
-                        max(self._ewma_rtt * 2.2, self._P2P_MIN_ACK_TIMEOUT_S),
-                        self._P2P_MAX_ACK_TIMEOUT_S,
+                        max(self._ewma_rtt * 2.5, 0.35),
+                        0.95,
                     )
                 else:  # "vps"
-                    # Drop to 1 in-flight frame when VPS RTT is high to eliminate TCP bufferbloat completely
-                    in_flight_limit = 1 if self._ewma_rtt > 0.20 else self._VPS_IN_FLIGHT_WINDOW
-                    ack_timeout = self._VPS_ACK_TIMEOUT_S
+                    in_flight_limit = 1 if self._ewma_rtt > 0.25 else self._VPS_IN_FLIGHT_WINDOW
+                    ack_timeout = min(max(self._ewma_rtt * 2.5, 0.45), 1.5)
 
                 # Backpressure flow control tuned separately for reliable TCP (LAN/VPS) vs UDP (P2P)
                 if self._in_flight_count() >= in_flight_limit:
@@ -1162,35 +1309,79 @@ class ScreenStreamer:
                     self._fps,
                     self._max_width,
                 )
-                subsampling = resolve_jpeg_subsampling(self._quality, transport_kind)
-                base_max_bytes = resolve_max_frame_bytes(self._quality, transport_kind)
+                is_roi_active = self._active_roi is not None
 
                 if transport_kind == "lan":
-                    eff_w, eff_q, eff_max_bytes = base_w, base_q, base_max_bytes
+                    eff_w = base_w
+                    eff_q = base_q
+                    eff_fps = target_fps
+                    eff_max_bytes = resolve_max_frame_bytes(self._quality, transport_kind, is_roi_active)
+                    subsampling = resolve_jpeg_subsampling(self._quality, transport_kind)
                 else:
-                    eff_w = max(int(round(base_w * self._adapt_scale)) & ~1, 640)
-                    eff_w = min(eff_w, base_w)
-                    eff_q = max(base_q - self._adapt_q_drop, 28)
-                    eff_max_bytes = max(int(base_max_bytes * self._adapt_budget_ratio), 12 * 1024)
-                    if transport_kind == "p2p" and self._p2p_acked_count == 0:
-                        # Gentle first P2P frame (~25-30 paced chunks) so link locks on immediately
-                        eff_max_bytes = min(eff_max_bytes, self._P2P_FIRST_FRAME_MAX_BYTES)
-                        eff_q = min(eff_q, 54)
+                    eff_w = max(int(round(base_w * self._adapt_scale)) & ~1, 960)
+                    eff_q = max(base_q - self._adapt_q_drop, 45)
+                    eff_fps = max(int(round(target_fps * self._adapt_fps_scale)), 2)
+                    base_bytes = resolve_max_frame_bytes(self._quality, transport_kind, is_roi_active)
+                    eff_max_bytes = max(int(base_bytes * self._adapt_budget_ratio), 18 * 1024)
+                    subsampling = resolve_jpeg_subsampling(self._quality, transport_kind)
 
-                frame_interval = 1.0 / float(max(target_fps, 1))
+                frame_interval = 1.0 / float(max(eff_fps, 1))
                 p2p_unacked_retry = (
                     transport_kind == "p2p"
                     and self._in_flight_count() > 0
-                    and (loop_start - self._last_sent_ts) >= self._P2P_RETRY_UNACKED_S
+                    and (loop_start - self._last_sent_ts) >= 0.65
                 )
                 if p2p_unacked_retry:
                     self._apply_timeout_backoff("p2p")
 
-                force_send = (
-                    self._force_keyframe
-                    or p2p_unacked_retry
-                    or (loop_start - self._last_sent_ts) >= self._KEEPALIVE_INTERVAL_S
+                # If user interacted recently, cancel pending refinement and treat as active motion
+                recent_user_input = (loop_start - self._input_activity_ts) < 0.20
+                if recent_user_input:
+                    refinement_armed_ts = None
+                    refinement_sent = False
+
+                is_still = (
+                    (self._last_signature is not None)
+                    and not self._force_keyframe
+                    and not p2p_unacked_retry
+                    and not recent_user_input
                 )
+
+                # --- STILL-SCREEN REFINEMENT LOGIC (PRIORITY 1) ---
+                is_refinement_frame = False
+                if is_still:
+                    if not refinement_sent:
+                        if refinement_armed_ts is None:
+                            refinement_armed_ts = loop_start + 0.250  # 250ms debounce
+                        elif loop_start >= refinement_armed_ts:
+                            is_refinement_frame = True
+                    else:
+                        keepalive_due = (loop_start - self._last_sent_ts) >= self._KEEPALIVE_INTERVAL_S
+                        if not keepalive_due:
+                            sleep_s = 0.1
+                            self._wake_event.clear()
+                            try:
+                                await asyncio.wait_for(self._wake_event.wait(), timeout=sleep_s)
+                            except asyncio.TimeoutError:
+                                pass
+                            continue
+
+                if is_refinement_frame:
+                    capture_w = base_w
+                    capture_q = 90
+                    capture_subsampling = 0
+                    capture_max_bytes = 140 * 1024 if not is_roi_active else 70 * 1024
+                    force_send = True
+                else:
+                    capture_w = eff_w
+                    capture_q = eff_q
+                    capture_subsampling = subsampling
+                    capture_max_bytes = eff_max_bytes
+                    force_send = (
+                        self._force_keyframe
+                        or p2p_unacked_retry
+                        or (loop_start - self._last_sent_ts) >= self._KEEPALIVE_INTERVAL_S
+                    )
 
                 executor = self._executor
                 if executor is None:
@@ -1199,22 +1390,30 @@ class ScreenStreamer:
                     executor,
                     self._capture_and_encode_sync,
                     self._monitor,
-                    eff_w,
-                    eff_q,
-                    subsampling,
+                    capture_w,
+                    capture_q,
+                    capture_subsampling,
                     force_send,
-                    eff_max_bytes,
+                    capture_max_bytes,
                     not self._hide_cursor,
+                    self._active_roi,
                 )
 
                 if not self._running:
                     break
 
                 if encoded is not None:
-                    jpeg_bytes, mon_idx, mon_cnt, out_w, out_h, cx, cy, has_cursor, sig = encoded
+                    jpeg_bytes, mon_idx, mon_cnt, out_w, out_h, cx, cy, has_cursor, sig, roi_out = encoded
                     self._last_signature = sig
                     self._force_keyframe = False
                     self._sent_seq = (self._sent_seq + 1) & 0xFFFFFFFF
+
+                    if is_refinement_frame:
+                        refinement_sent = True
+                        refinement_armed_ts = None
+                    else:
+                        refinement_sent = False
+                        refinement_armed_ts = None
 
                     wire_frame = pack_screen_frame(
                         seq=self._sent_seq,
@@ -1227,6 +1426,7 @@ class ScreenStreamer:
                         has_cursor=has_cursor,
                         payload=jpeg_bytes,
                         keyframe=True,
+                        roi=roi_out,
                     )
 
                     sent_via_p2p = False
@@ -1254,7 +1454,6 @@ class ScreenStreamer:
                     except asyncio.TimeoutError:
                         pass
                 else:
-                    # Yield without sleeping 15ms on Windows default timer granularity
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise

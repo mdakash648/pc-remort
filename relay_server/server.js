@@ -19,7 +19,7 @@ const PORT = Number(process.env.PORT || 8770);
 const UDP_PORT = Number(process.env.UDP_PORT || 8771);
 const HOST = process.env.HOST || "0.0.0.0";
 const MAX_PAYLOAD_BYTES = 512 * 1024; // 512 KB (supports multi-paragraph paste)
-const MAX_SCREEN_BUFFERED_BYTES = 64 * 1024; // Drop/coalesce stale RSCR screen frames when phone link is congested
+const MAX_SCREEN_BUFFERED_BYTES = 128 * 1024; // Drop/coalesce stale RSCR screen frames when phone link is congested (allows 90-120 KB text clarity frames)
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const REGISTER_TIMEOUT_MS = 10_000;
 

@@ -13,13 +13,20 @@ from typing import Any
 import pystray
 from PIL import Image, ImageDraw, ImageTk
 
-from config import get_config_dir, get_shared_config_dir
+from config import (
+    AgentConfig,
+    get_config_dir,
+    get_shared_config_dir,
+    get_user_config_dir,
+    sync_config_to_shared,
+)
 from core.runtime import AgentRuntime, AgentStatus, generate_relay_token, validate_relay_settings
 from core.windows_integration import (
     enable_high_dpi_awareness,
     get_resource_path,
     is_admin,
     is_autostart_enabled,
+    is_system,
     open_folder_in_explorer,
     relaunch_as_admin,
     run_elevated_flag,
@@ -1079,6 +1086,18 @@ class RemotePadTrayApp:
                     relay_token=token,
                     persist=True,
                 )
+                if not is_system():
+                    try:
+                        user_cfg_path = get_user_config_dir() / "config.json"
+                        user_cfg = AgentConfig.load(user_cfg_path)
+                        user_cfg.relay_enabled = relay_enabled
+                        user_cfg.relay_url = relay_url
+                        user_cfg.relay_device_id = device_id
+                        user_cfg.relay_token = token
+                        user_cfg.save()
+                        sync_config_to_shared()
+                    except Exception as sync_exc:
+                        logger.debug("Failed saving user-level config mirror: %s", sync_exc)
             except Exception as exc:
                 self._post_to_ui(lambda: self._on_save_done(str(exc)))
                 return
